@@ -165,6 +165,27 @@ def main(job_config: JobConfig):
     )
     train_spec = get_train_spec(job_config.model.name)
 
+    # verify batch sizes
+    if job_config.training.global_batch_size is None:
+        job_config.training.global_batch_size = \
+            job_config.training.batch_size * dp_degree
+    assert job_config.training.global_batch_size > 0
+    assert (
+        job_config.training.global_batch_size
+        % (job_config.training.batch_size * dp_degree)
+        == 0
+    ), (
+        f"global batch size must be multiple of local batch size times "
+        f"data-parallel degree ({job_config.training.global_batch_size} "
+        f"% ({job_config.training.batch_size} * {dp_degree}) != 0)"
+    )
+
+    gradient_accumulation_steps = (
+        job_config.training.global_batch_size
+        // (job_config.training.batch_size * dp_degree)
+    )
+    assert gradient_accumulation_steps > 0
+
     # build dataloader
     tokenizer = train_spec.tokenizer_cls(job_config.model.tokenizer_path)
 
@@ -338,7 +359,8 @@ def main(job_config: JobConfig):
     logger.info(
         f"Training starts at step {train_state.step + 1}, "
         f"with local batch size {job_config.training.batch_size}, "
-        f"global batch size {job_config.training.batch_size * dp_degree}, "
+        f"global batch size {job_config.training.global_batch_size}, "
+        f"gradient accumulation steps {gradient_accumulation_steps}, "
         f"sequence length {job_config.training.seq_len}, "
         f"total steps {job_config.training.steps} "
         f"(warmup {job_config.lr_scheduler.warmup_steps})"
@@ -352,31 +374,33 @@ def main(job_config: JobConfig):
             train_state.step += 1
             gc_handler.run(train_state.step)
 
-            (
-                input_ids,
-                labels,
-                data_loading_time,
-                batch_ntokens,
-            ) = _get_batch(data_iterator, device_type)
-            metrics_processor.ntokens_since_last_log += batch_ntokens
-            metrics_processor.data_loading_times.append(data_loading_time)
-
             optimizers.zero_grad()
 
-            loss = _batch_backward(
-                model_parts,
-                input_ids,
-                labels,
-                train_spec,
-                train_context,
-                parallel_dims,
-                world_mesh,
-                pp_schedule,
-                has_first_stage,
-                has_last_stage,
-                device,
-                job_config,
-            )
+            for microbatch in range(gradient_accumulation_steps):
+                (
+                    input_ids,
+                    labels,
+                    data_loading_time,
+                    batch_ntokens,
+                ) = _get_batch(data_iterator, device_type)
+                metrics_processor.ntokens_since_last_log += batch_ntokens
+                metrics_processor.data_loading_times.append(data_loading_time)
+
+                loss = _batch_backward(
+                    model_parts,
+                    input_ids,
+                    labels,
+                    train_spec,
+                    train_context,
+                    parallel_dims,
+                    world_mesh,
+                    pp_schedule,
+                    has_first_stage,
+                    has_last_stage,
+                    device,
+                    job_config,
+                )
+                metrics_processor.accumulated_losses.append(loss.detach())
 
             # clip gradients
             dist_utils.clip_grad_norm_(
@@ -390,6 +414,9 @@ def main(job_config: JobConfig):
             checkpoint.maybe_wait_for_staging()
             optimizers.step()
             lr_schedulers.step()
+
+            loss = torch.mean(torch.stack(metrics_processor.accumulated_losses))
+            metrics_processor.accumulated_losses.clear()
 
             # log metrics
             if metrics_processor.should_log(train_state.step):
