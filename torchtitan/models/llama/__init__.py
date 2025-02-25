@@ -171,3 +171,18 @@ register_train_spec(
         loss_fn=cross_entropy_loss,
     )
 )
+
+register_train_spec(
+    TrainSpec(
+        name="byte_llama2",
+        cls=Transformer,
+        config=llama2_configs,
+        parallelize_fn=parallelize_llama,
+        pipelining_fn=pipeline_llama,
+        build_optimizers_fn=build_optimizers,
+        build_lr_schedulers_fn=build_lr_schedulers,
+        build_dataloader_fn=build_hf_dataloader,
+        tokenizer_cls=ByteTokenizer,
+        loss_fn=cross_entropy_loss,
+    )
+)
