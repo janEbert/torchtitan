@@ -424,7 +424,7 @@ def main(job_config: JobConfig):
                 metrics_processor.accumulated_losses.append(loss.detach())
 
             # clip gradients
-            dist_utils.clip_grad_norm_(
+            grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in model_parts for p in m.parameters()],
                 job_config.training.max_norm,
                 foreach=True,
@@ -455,7 +455,14 @@ def main(job_config: JobConfig):
                     global_avg_loss = global_max_loss = loss.item()
 
                 metrics_processor.log(
-                    train_state.step, global_avg_loss, global_max_loss
+                    train_state.step, 
+                    {
+                        "loss_metrics/global_avg_loss": global_avg_loss,
+                        "loss_metrics/global_max_loss": global_max_loss,
+                    },
+
+                    f"{color.green}avg_loss: {global_avg_loss:7.4f}  "
+                    f"{color.green}gn: {grad_norm:7.4f}  "
                 )
 
             checkpoint.save(

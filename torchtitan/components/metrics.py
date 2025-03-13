@@ -11,7 +11,11 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 import torch
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
+
 from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer
 from torchtitan.config_manager import JobConfig
 from torchtitan.distributed import ParallelDims
@@ -113,6 +117,10 @@ class TensorBoardLogger(BaseLogger):
 
     def __init__(self, log_dir: str, tag: Optional[str] = None):
         self.tag = tag
+        if SummaryWriter is None:
+            raise ImportError(
+                "TensorBoard logging requires TensorBoard, please install it using 'pip install tensorboard'"
+            )
         self.writer = SummaryWriter(log_dir, max_queue=1000)
         logger.info(f"TensorBoard logging enabled. Logs will be saved at {log_dir}")
 
@@ -340,7 +348,9 @@ class MetricsProcessor:
     def should_log(self, step: int) -> bool:
         return step == 1 or step % self.job_config.metrics.log_freq == 0
 
-    def log(self, step: int, global_avg_loss: float, global_max_loss: float):
+    # def log(self, step: int, global_avg_loss: float, global_max_loss: float):
+    def log(self, step: int, dict_to_log: dict = {}, extra_to_print: str = ""):
+
         assert self.num_flop_per_token > 0, "num_flop_per_token must be set"
 
         time_delta = time.perf_counter() - self.time_last_log
@@ -362,8 +372,8 @@ class MetricsProcessor:
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
 
         metrics = {
-            "loss_metrics/global_avg_loss": global_avg_loss,
-            "loss_metrics/global_max_loss": global_max_loss,
+            # "loss_metrics/global_avg_loss": global_avg_loss,
+            # "loss_metrics/global_max_loss": global_max_loss,
             "throughput(tps)": tps,
             "tflops": tflops,
             "mfu(%)": mfu,
@@ -376,17 +386,17 @@ class MetricsProcessor:
             "memory/max_reserved(%)": device_mem_stats.max_reserved_pct,
             "memory/num_alloc_retries": device_mem_stats.num_alloc_retries,
             "memory/num_ooms": device_mem_stats.num_ooms,
-        }
+        }.update(dict_to_log)
         self.logger.log(metrics, step)
 
         color = self.color
         logger.info(
             f"{color.red}step: {step:2}  "
-            f"{color.green}loss: {global_avg_loss:7.4f}  "
             f"{color.yellow}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
             f"{color.blue}tps: {round(tps):,}  "
             f"{color.cyan}tflops: {tflops:,.2f}  "
+            f"{extra_to_print}"
             f"{color.magenta}mfu: {mfu:.2f}%{color.reset}"
         )
 
