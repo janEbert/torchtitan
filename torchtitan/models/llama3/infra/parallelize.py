@@ -31,7 +31,7 @@ from torch.distributed.tensor.parallel import (
 from torchtitan.config import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.config.job_config import ActivationCheckpoint as ACConfig
 from torchtitan.distributed import ParallelDims
-from torchtitan.models.llama3.model.model import BitNetTransformerBlock
+from torchtitan.models.llama3.model.bitnet_model import BitNetTransformerBlock
 from torchtitan.tools.logging import logger
 
 
