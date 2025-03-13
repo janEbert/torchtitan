@@ -250,6 +250,19 @@ class Attention(nn.Module):
                 eps=model_args.norm_eps,
             )
 
+        self.qk_norm = model_args.qk_norm
+        if self.qk_norm:
+            self.q_norm = build_norm(
+                model_args.norm_type,
+                dim=self.head_dim,
+                eps=model_args.norm_eps,
+            )
+            self.k_norm = build_norm(
+                model_args.norm_type,
+                dim=self.head_dim,
+                eps=model_args.norm_eps,
+            )
+
     def init_weights(self, init_std: float):
         for linear in (self.wq, self.wk, self.wv):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
