@@ -504,6 +504,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         extra_log_data = {
             "optim/grad_norm": grad_norm,
         }
+        extra_log_data.update(self.optimizers.get_lrs())
+        if (self.step == 1 or self.step % self.job_config.metrics.log_norm_freq == 0):
+            if self.job_config.optimizer.name == "Muon":
+                extra_log_data.update(self.optimizers.get_muon_parameter_norms())
+
         if aux_loss is not None:
             extra_log_data["loss_metrics/aux_loss"] = aux_loss
         if moe_entropy_per_layer is not None:

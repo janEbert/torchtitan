@@ -31,6 +31,17 @@ __all__ = [
     "build_optimizers",
 ]
 
+def l1_to_rms_norm(W):
+    norm = torch.max(torch.norm(W.data.to(torch.float32), p=2, dim=0, dtype=torch.float32))
+    scale = torch.sqrt(torch.tensor(W.data.shape[0], dtype=W.dtype, device=W.device))
+    norm /= scale
+    return norm
+
+def rms_to_l1_norm(W):
+    norm = torch.max(torch.norm(W.data.to(torch.float32), p=2, dim=1, dtype=torch.float32))
+    scale = torch.sqrt(torch.tensor(W.data.shape[1], dtype=W.dtype, device=W.device))
+    norm *= scale
+    return norm
 
 def _extract_param_groups(
     model: torch.nn.Module,
@@ -93,6 +104,11 @@ class OptimizersContainer(Optimizer, Generic[T]):
 
     optimizers: List[T]
     model_parts: List[nn.Module]
+    norm_functions = {
+        'spectral_norm': lambda x: torch.linalg.norm(x.data.to(torch.float32), ord=2, dtype=torch.float32),
+        'l1_to_rms': lambda x: l1_to_rms_norm(x),
+        'rms_to_l1': lambda x: rms_to_l1_norm(x),
+    }
 
     def __init__(
         self,
@@ -145,6 +161,35 @@ class OptimizersContainer(Optimizer, Generic[T]):
         )
         list(map(func, self.model_parts, self.optimizers))
 
+    def get_muon_parameter_norms(self):
+        norms = {}
+        for i, _ in enumerate(self.model_parts):
+            # NB: assumes correspondences between model parts and optimizers
+            for group in self.optimizers[i].param_groups: 
+                param_kwargs = {
+                    'momentum': group['momentum'],
+                    'nesterov': group['nesterov'],
+                    'eps': group['eps'],
+                    'norm_factor': group['norm_factor'],
+                    'zeropower_backend': zeropower_backends[group['backend']],
+                    'backend_steps': group['backend_steps']
+                }
+                for n, p in zip(group['param_names'], group['params']):
+                    g = self.optimizers[i]._compute_grad(p, **param_kwargs)
+                    if g is not None:
+                        update = -g*group['lr']
+                        for norm_name, norm_func in self.norm_functions.items():
+                            norms[f'model_part_{i}/{n}/param/{norm_name}'] = norm_func(p)
+                            norms[f'model_part_{i}/{n}/update/{norm_name}'] = norm_func(update)
+        return norms
+
+    def get_lrs(self):
+        lrs = {}
+        assert len(self.model_parts) == 1, "Require that model_parts is the whole model"
+        for i, group in enumerate(self.optimizers[0].param_groups): 
+            lrs[f'lr/group_{i}'] = group['lr']
+        return lrs
+    
     def _validate_length(self, expected_length: int) -> None:
         assert expected_length == len(self.optimizers), (
             "Must pass one optimizer per model part or per param if "
