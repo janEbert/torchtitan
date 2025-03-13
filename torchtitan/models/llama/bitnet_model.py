@@ -60,7 +60,6 @@ class BitNetAttention(Attention):
             torch.Tensor: Output tensor after attention.
 
         """
-
         bs, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
