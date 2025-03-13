@@ -45,6 +45,7 @@ class TransformerModelArgs(BaseModelArgs):
     # `False`, each uses the total number of transformer blocks
     depth_init: bool = True
     norm_type: str = "rmsnorm"
+    qk_norm: bool = False
 
     use_flex_attn: bool = False
 
@@ -218,6 +219,19 @@ class Attention(nn.Module):
         )
         self.use_flex_attn = model_args.use_flex_attn
 
+        self.qk_norm = model_args.qk_norm
+        if self.qk_norm:
+            self.q_norm = build_norm(
+                model_args.norm_type,
+                dim=self.head_dim,
+                eps=model_args.norm_eps,
+            )
+            self.k_norm = build_norm(
+                model_args.norm_type,
+                dim=self.head_dim,
+                eps=model_args.norm_eps,
+            )
+
     def init_weights(self, init_std: float):
         for linear in (self.wq, self.wk, self.wv):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
@@ -249,6 +263,11 @@ class Attention(nn.Module):
         xq = xq.view(bs, seqlen, -1, self.head_dim)
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
+
+        # Apply optional QK normalization
+        if self.qk_norm:
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
@@ -595,6 +614,11 @@ class BitNetAttention(Attention):
         xq = xq.view(bs, seqlen, -1, self.head_dim)
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
+
+        # Apply optional QK normalization
+        if self.qk_norm:
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
