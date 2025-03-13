@@ -161,19 +161,23 @@ class OptimizersContainer(Optimizer, Generic[T]):
         )
         list(map(func, self.model_parts, self.optimizers))
 
-    def get_muon_parameter_norms(self):
+    def get_parameter_norms(self, optimizer_name):
         norms = {}
         for i, _ in enumerate(self.model_parts):
             # NB: assumes correspondences between model parts and optimizers
             for group in self.optimizers[i].param_groups: 
-                param_kwargs = {
-                    'momentum': group['momentum'],
-                    'nesterov': group['nesterov'],
-                    'eps': group['eps'],
-                    'norm_factor': group['norm_factor'],
-                    'zeropower_backend': zeropower_backends[group['backend']],
-                    'backend_steps': group['backend_steps']
-                }
+                if optimizer_name == 'Muon':
+                    param_kwargs = {
+                        'momentum': group['momentum'],
+                        'nesterov': group['nesterov'],
+                        'eps': group['eps'],
+                        'norm_factor': group['norm_factor'],
+                        'zeropower_backend': zeropower_backends[group['backend']],
+                        'backend_steps': group['backend_steps']
+                    }
+                else:
+                    raise NotImplementedError(f"Optimizer {optimizer_name} not added for norm computation.")
+                
                 for n, p in zip(group['param_names'], group['params']):
                     g = self.optimizers[i]._compute_grad(p, **param_kwargs)
                     if g is not None:
