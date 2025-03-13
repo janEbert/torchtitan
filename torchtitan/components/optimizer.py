@@ -5,7 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 import functools
-from typing import Any, Dict, Generic, List, TypeVar
+import math
+from typing import Any, Callable, Dict, Generic, List, TypeVar, Union
+import re
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -28,6 +31,32 @@ __all__ = [
     "build_optimizers",
 ]
 
+
+def _extract_param_groups(
+    model: torch.nn.Module,
+    optimizer_config: Dict[str, Any] = None,
+):
+    if optimizer_config is None:
+        return model.parameters()
+
+    param_groups_config = optimizer_config.pop('param_groups', None)
+    if param_groups_config is not None:
+        params = []
+        param_dict = OrderedDict((n, p) for n, p in model.named_parameters() if p.requires_grad)
+
+        for param_group_config in param_groups_config:
+            str_match = param_group_config.pop('param_str_match')
+            filter_fn = functools.partial(re.search, str_match)
+            param_names = [n for n in param_dict.keys() if filter_fn(n)]
+            group_params = {'params': [param_dict.pop(n) for n in param_names], 'param_names': param_names}
+            assert len(group_params['params']) == len(group_params['param_names'])
+            group_params.update(param_group_config)
+            params.append(group_params)
+
+        params.insert(0, {'params': param_dict.values(), 'param_names': list(param_dict.keys())})
+        return params
+
+    return model.parameters()
 
 if has_torchft:
     import torchft as ft
@@ -75,22 +104,13 @@ class OptimizersContainer(Optimizer, Generic[T]):
         self.optimizers: List[T] = []
         self.model_parts = model_parts
         for model in self.model_parts:
-            params = [p for p in model.parameters() if p.requires_grad]
-
-            # for muon, we need to pass model as well
-
-            is_muon = issubclass(optimizer_cls, (Muon, DistributedMuon, DistributedMuonV2))
-            extra_kwargs = optimizer_kwargs.pop("extra_kwargs")
-
-            if is_muon:
-                optimizer_kwargs.update(extra_kwargs)
-                self.optimizers.append(optimizer_cls(params, model, **optimizer_kwargs))
-            else:
-                self.optimizers.append(optimizer_cls(params, **optimizer_kwargs))
-
+            kwargs = copy.deepcopy(optimizer_kwargs) # to preserve popped objects across model parts
+            params = _extract_param_groups(model, kwargs)
+            params = list(params)
+            self.optimizers.append(optimizer_cls(params, **kwargs))
             all_params.extend(params)
         self._validate_length(len(self.model_parts))
-        self._post_init(all_params, optimizer_kwargs)
+        self._post_init(all_params, kwargs) # use the latest kwargs after popping param groups
 
     def __iter__(self) -> Optimizer:
         return iter(self.optimizers)
@@ -285,20 +305,56 @@ def build_optimizers(
     eps = job_config.optimizer.eps
     weight_decay = job_config.optimizer.weight_decay
 
-    optim_implementation = job_config.optimizer.implementation
-    assert optim_implementation in ["fused", "foreach", "for-loop"]
+    if name in ["Adam", "AdamW"]:
+        optim_implementation = job_config.optimizer.implementation
+        assert optim_implementation in ["fused", "foreach", "for-loop"]
 
-    fused = optim_implementation == "fused"
-    foreach = optim_implementation == "foreach"
+        fused = optim_implementation == "fused"
+        foreach = optim_implementation == "foreach"
 
-    optimizer_kwargs = {
-        "lr": lr,
-        "eps": eps,
-        "betas": (0.9, 0.95),
-        "weight_decay": weight_decay,
-        "fused": fused,
-        "foreach": foreach,
-    }
+        optimizer_kwargs = {
+            "lr": lr,
+            "eps": eps,
+            "betas": (0.9, 0.95),
+            "weight_decay": 0.1,
+            "fused": fused,
+            "foreach": foreach,
+        }
+    elif name == "Muon":
+        backend_steps = job_config.optimizer.backend_steps
+        momentum = job_config.optimizer.momentum
+        nesterov = job_config.optimizer.nesterov
+        embed_lr = job_config.optimizer.embed_lr
+        unembed_lr = job_config.optimizer.unembed_lr
+        embed_str_match = job_config.optimizer.embed_str_match
+        unembed_str_match = job_config.optimizer.unembed_str_match
+
+        optimizer_kwargs = {
+                "lr": lr,
+                'momentum': momentum,
+                'nesterov': nesterov,
+                'eps': eps,
+                'norm_factor': 'spectral',
+                'backend': 'newtonschulz5',
+                'backend_steps': backend_steps,
+                'param_groups':
+                    [
+                        {
+                            'param_str_match': embed_str_match,
+                            'lr': embed_lr,
+                            'norm_factor': 'embed_linear',
+                            'backend': 'identity'
+                        },
+                        { 
+                            'param_str_match': unembed_str_match,
+                            'lr': unembed_lr,
+                            'norm_factor': 'unembed_linear',
+                            'backend': 'identity'
+                        }
+                    ]
+        }
+    else:
+        raise NotImplementedError(f"Optimizer {name} not added.")
 
     optimizer_kwargs["extra_kwargs"] = extra_kwargs
 
