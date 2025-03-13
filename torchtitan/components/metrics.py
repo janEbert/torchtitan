@@ -138,7 +138,11 @@ class TensorBoardLogger(BaseLogger):
 class WandBLogger(BaseLogger):
     """Logger implementation for Weights & Biases."""
 
-    def __init__(self, log_dir: str, tag: Optional[str] = None):
+    def __init__(self, log_dir: str, 
+                    project: Optional[str] = None,
+                    group: Optional[str] = None,
+                    name: Optional[str] = None,
+                    tag: Optional[str] = None):
         # Import wandb here to avoid startup import
         import wandb
 
@@ -149,7 +153,9 @@ class WandBLogger(BaseLogger):
         os.makedirs(log_dir, exist_ok=True)
 
         self.wandb.init(
-            project=os.getenv("WANDB_PROJECT", "torchtitan"),
+            project=project,
+            group=group,
+            name=name,
             dir=log_dir,
         )
         logger.info("WandB logging enabled")
@@ -273,8 +279,11 @@ def _build_metric_logger(
     # Create loggers in priority order
     if metrics_config.enable_wandb:
         logger.debug("Attempting to create WandB logger")
+        project = metrics_config.wandb_project 
+        group = metrics_config.wandb_group
+        name = metrics_config.wandb_name
         try:
-            return WandBLogger(base_log_dir, tag)
+            return WandBLogger(base_log_dir, project, group, name, tag)
         except Exception as e:
             if "No module named 'wandb'" in str(e):
                 logger.error(
