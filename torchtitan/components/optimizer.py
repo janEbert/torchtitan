@@ -21,6 +21,8 @@ from torchtitan.config_manager import JobConfig
 
 from optimizers import DistributedMuon, DistributedMuonV2, Muon
 
+from optimizers import DistributedMuon, DistributedMuonV2, Muon
+
 __all__ = [
     "OptimizersContainer",
     "build_optimizers",
