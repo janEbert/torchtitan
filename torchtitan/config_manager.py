@@ -270,13 +270,13 @@ class JobConfig:
             "--optimizer.weight_decay", type=float, default=0.1, help="Weight decay value to use"
         )
         self.parser.add_argument(
-            "--optimizer.backend_steps", type=int, help="Number of steps for the Muon backend"
+            "--optimizer.backend_steps", type=int, help="Number of steps for the Scion backend"
         )
         self.parser.add_argument(
             "--optimizer.momentum", type=float, help="Momentum to use"
         )
         self.parser.add_argument(
-            "--optimizer.nesterov", action="store_true", help="Whether to use Nesterov momentum in Muon"
+            "--optimizer.nesterov", action="store_true", help="Whether to use Nesterov momentum in Scion"
         )
         self.parser.add_argument(
             "--optimizer.embed_lr", type=float, help="Embedding layer learning rate"
