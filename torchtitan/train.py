@@ -48,18 +48,18 @@ def _get_batch(data_iterator, device_type):
 
 
 def _batch_backward(
-        model_parts,
-        input_ids,
-        labels,
-        train_spec,
-        train_context,
-        parallel_dims,
-        world_mesh,
-        pp_schedule,
-        has_first_stage,
-        has_last_stage,
-        device,
-        job_config,
+    model_parts,
+    input_ids,
+    labels,
+    train_spec,
+    train_context,
+    parallel_dims,
+    world_mesh,
+    pp_schedule,
+    has_first_stage,
+    has_last_stage,
+    device,
+    job_config,
 ):
     # apply context parallelism if cp is enabled
     # ensure CP handles the separate freqs_cis buffer for each pp stage
@@ -96,13 +96,22 @@ def _batch_backward(
 
         # Non-PP forward / backward
         with train_context(optional_context_parallel_ctx):
-            pred = model(input_ids)
+            output = model(input_ids)
+            if isinstance(output, tuple):
+                pred = output[0]
+                aux_loss = output[1]
+            else:
+                aux_loss = None
+                pred = output
             loss = train_spec.loss_fn(pred, labels)
+            if aux_loss is not None:
+                loss += aux_loss
+
             # pred.shape=(bs, seq_len, vocab_size)
             # need to free to before bwd to avoid peaking memory
             del pred
             loss.backward()
-    return loss
+    return loss, aux_loss
 
 
 # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
@@ -169,8 +178,9 @@ def main(job_config: JobConfig):
 
     # verify batch sizes
     if job_config.training.global_batch_size is None:
-        job_config.training.global_batch_size = \
+        job_config.training.global_batch_size = (
             job_config.training.batch_size * dp_degree
+        )
     assert job_config.training.global_batch_size > 0
     assert (
         job_config.training.global_batch_size
@@ -182,9 +192,8 @@ def main(job_config: JobConfig):
         f"% ({job_config.training.batch_size} * {dp_degree}) != 0)"
     )
 
-    gradient_accumulation_steps = (
-        job_config.training.global_batch_size
-        // (job_config.training.batch_size * dp_degree)
+    gradient_accumulation_steps = job_config.training.global_batch_size // (
+        job_config.training.batch_size * dp_degree
     )
     assert gradient_accumulation_steps > 0
 
@@ -223,8 +232,7 @@ def main(job_config: JobConfig):
     if job_config.model.vocab_size_multiple_of:
         vocab_divisor = job_config.model.vocab_size_multiple_of
         model_config.vocab_size = int(
-            math.ceil(model_config.vocab_size / vocab_divisor)
-            * vocab_divisor
+            math.ceil(model_config.vocab_size / vocab_divisor) * vocab_divisor
         )
         logger.info(
             f"Padded vocab size from {tokenizer.n_words} to {model_config.vocab_size}."
@@ -237,6 +245,8 @@ def main(job_config: JobConfig):
     )
     with torch.device("meta"):
         model = model_cls.from_model_args(model_config)
+
+    logger.info(f"model:{model}")
 
     # Build the collection of model converters. No-op if `model.converters` empty
     model_converters = build_model_converters(job_config, parallel_dims)
@@ -386,17 +396,19 @@ def main(job_config: JobConfig):
         f"total steps {job_config.training.steps} "
         f"(warmup {job_config.lr_scheduler.warmup_steps})"
     )
-    with maybe_enable_profiling(
-        job_config, global_step=train_state.step
-    ) as torch_profiler, maybe_enable_memory_snapshot(
-        job_config, global_step=train_state.step
-    ) as memory_profiler:
+    with (
+        maybe_enable_profiling(
+            job_config, global_step=train_state.step
+        ) as torch_profiler,
+        maybe_enable_memory_snapshot(
+            job_config, global_step=train_state.step
+        ) as memory_profiler,
+    ):
         while train_state.step < job_config.training.steps:
             train_state.step += 1
             gc_handler.run(train_state.step)
 
             optimizers.zero_grad()
-
             for microbatch in range(gradient_accumulation_steps):
                 (
                     input_ids,
@@ -407,7 +419,7 @@ def main(job_config: JobConfig):
                 metrics_processor.ntokens_since_last_log += batch_ntokens
                 metrics_processor.data_loading_times.append(data_loading_time)
 
-                loss = _batch_backward(
+                loss, aux_loss = _batch_backward(
                     model_parts,
                     input_ids,
                     labels,
@@ -422,6 +434,8 @@ def main(job_config: JobConfig):
                     job_config,
                 )
                 metrics_processor.accumulated_losses.append(loss.detach())
+                if aux_loss is not None:
+                    metrics_processor.accumulated_aux_losses.append(aux_loss.detach())
 
             # clip gradients
             grad_norm = dist_utils.clip_grad_norm_(
@@ -437,6 +451,12 @@ def main(job_config: JobConfig):
             lr_schedulers.step()
 
             loss = torch.sum(torch.stack(metrics_processor.accumulated_losses))
+            if len(metrics_processor.accumulated_aux_losses) > 0:
+                aux_loss = torch.sum(
+                    torch.stack(metrics_processor.accumulated_aux_losses)
+                )
+                metrics_processor.accumulated_aux_losses.clear()
+
             metrics_processor.accumulated_losses.clear()
 
             # log metrics
@@ -451,18 +471,27 @@ def main(job_config: JobConfig):
                         dist_utils.dist_mean(loss, world_mesh["dp_cp"]),
                         dist_utils.dist_max(loss, world_mesh["dp_cp"]),
                     )
+                    if aux_loss is not None:
+                        aux_loss = dist_utils.dist_mean(aux_loss, world_mesh["dp_cp"])
                 else:
                     global_avg_loss = global_max_loss = loss.item()
 
-                metrics_processor.log(
-                    train_state.step, 
-                    {
-                        "loss_metrics/global_avg_loss": global_avg_loss,
-                        "loss_metrics/global_max_loss": global_max_loss,
-                    },
+                extra_metrics_log = {
+                    "loss_metrics/global_avg_loss": global_avg_loss,
+                    "loss_metrics/global_max_loss": global_max_loss,
+                }
+                if aux_loss is not None:
+                    extra_metrics_log["loss_metrics/aux_loss"] = aux_loss
 
+                extra_str_print = (
                     f"{color.green}avg_loss: {global_avg_loss:7.4f}  "
                     f"{color.green}gn: {grad_norm:7.4f}  "
+                )
+
+                metrics_processor.log(
+                    train_state.step,
+                    extra_metrics_log,
+                    extra_str_print,
                 )
 
             checkpoint.save(
