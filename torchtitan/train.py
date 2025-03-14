@@ -204,6 +204,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         logger.info(f"model: {model}")
 
+        logger.info(f"model: {model}")
+
         # Build the collection of model converters. No-op if `model.converters` empty
         model_converters = build_model_converters(job_config, parallel_dims)
         model_converters.convert(model)
