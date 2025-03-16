@@ -19,6 +19,7 @@ def zeropower_via_newtonschulz5(G, steps):
     """
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750, 2.0315)
+    original_dtype = G.dtype
     X = G.bfloat16()
     if G.size(0) > G.size(1):
         X = X.T
@@ -34,19 +35,7 @@ def zeropower_via_newtonschulz5(G, steps):
 
     if G.size(0) > G.size(1):
         X = X.T
-    return X
-
-
-class DTensorHandle:
-    def __init__(self, dtensor):
-        self.dtensor = dtensor
-        # Store the local tensor to avoid extra copies
-
-    def wait(self):
-        # Create a replicated DTensor
-        # In a real implementation, this would be an async operation
-        # that we're waiting for here
-        return self.dtensor.full_tensor()
+    return X.to(original_dtype)
 
 
 class DistributedMuon(torch.optim.Optimizer):
@@ -146,11 +135,24 @@ class DistributedMuon(torch.optim.Optimizer):
     def shard_grad(self, u):
         """Shards the update tensor after Newton-Schulz iteration."""
         if not self.fsdp_enabled:
+            dist.all_reduce(u, op=dist.ReduceOp.SUM)
             return u
 
         assert isinstance(u, DTensor), "Expected gradient to be a DTensor"
 
-        sharded_update = u.redistribute(placements=[Shard(0)])
+        full_update = u.to_local()
+        dist.all_reduce(full_update, op=dist.ReduceOp.SUM)
+
+        # Convert back to DTensor with replicated placement
+        full_update_dt = DTensor.from_local(
+            full_update,
+            device_mesh=u.device_mesh,
+            placements=[Replicate()] * u.device_mesh.ndim,
+        )
+
+        # Now re-shard the update to match the parameter's sharding
+        sharded_update = full_update_dt.redistribute(placements=[Shard(0)])
+
         return sharded_update
 
     def update_momentum(self, p, g, momentum, nesterov):
@@ -211,30 +213,22 @@ class DistributedMuon(torch.optim.Optimizer):
                     g = g.view(g.size(0), -1)
                 assert g is not None
 
-                if group_idx < start_idx or group_idx >= end_idx:
-                    g = self.gather_full_grad(torch.zeros_like(p.grad))
-                    continue
-
                 ############################
                 # DISTRIBUTED MUON UPDATE #
                 # Step 1: Gather full gradient across ranks
                 g = self.gather_full_grad(p.grad)
 
-                # calc update with momentum
-                g = self.update_momentum(p, g, momentum, group["nesterov"])
-
-                u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
-                # u = torch.zeros_like(g)  # easier for debugging
+                if group_idx < start_idx or group_idx >= end_idx:
+                    # calc update with momentum
+                    u = torch.zeros_like(g)
+                else:
+                    g = self.update_momentum(p, g, momentum, group["nesterov"])
+                    u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
 
                 ############################
                 # DISTRIBUTED MUON UPDATE #
                 # Step 2: Extract the correct shard for this rank
                 u = self.shard_grad(u)
-
-                if u.shape != p.data.shape:
-                    raise RuntimeError(
-                        f"Shape mismatch: u.shape={u.shape}, p.data.shape={p.data.shape}"
-                    )
 
                 # apply weight decay
                 p.data.mul_(1 - lr * wd)

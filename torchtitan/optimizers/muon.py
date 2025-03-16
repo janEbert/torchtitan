@@ -19,6 +19,7 @@ def zeropower_via_newtonschulz5(G, steps):
     """
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750, 2.0315)
+    original_dtype = G.dtype
     X = G.bfloat16()
     if G.size(0) > G.size(1):
         X = X.T
@@ -34,7 +35,7 @@ def zeropower_via_newtonschulz5(G, steps):
 
     if G.size(0) > G.size(1):
         X = X.T
-    return X
+    return X.to(original_dtype)
 
 
 class Muon(torch.optim.Optimizer):
@@ -119,14 +120,6 @@ class Muon(torch.optim.Optimizer):
             # Do not use Muon for parameters in adamw_params
             self.state[p]["use_muon"] = False
 
-    def adjust_lr_for_muon(self, lr, param_shape):
-        A, B = param_shape[:2]
-        # We adjust the learning rate and weight decay based on the size of the parameter matrix
-        # as describted in the paper
-        adjusted_ratio = 0.2 * math.sqrt(max(A, B))
-        adjusted_lr = lr * adjusted_ratio
-        return adjusted_lr
-
     def gather_full_grad(self, g):
         """Gathers the full gradient across all distributed processes using DTensor."""
         if not self.fsdp_enabled:
@@ -207,16 +200,12 @@ class Muon(torch.optim.Optimizer):
                 g = self.update_momentum(p, g, momentum, group["nesterov"])
 
                 u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                # cast u back to g's dtype
 
                 ############################
                 # DISTRIBUTED MUON UPDATE #
                 # Step 2: Extract the correct shard for this rank
                 u = self.shard_grad(u)
-
-                if u.shape != p.data.shape:
-                    raise RuntimeError(
-                        f"Shape mismatch: u.shape={u.shape}, p.data.shape={p.data.shape}"
-                    )
 
                 # apply weight decay
                 p.data.mul_(1 - lr * wd)
