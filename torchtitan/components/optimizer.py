@@ -84,9 +84,10 @@ class OptimizersContainer(Optimizer, Generic[T]):
 
             # for muon, we need to pass model as well
 
-            is_muon = issubclass(optimizer_cls, (Muon, DistributedMuon, DistributedMuonV2))
+            is_muon = issubclass(
+                optimizer_cls, (Muon, DistributedMuon, DistributedMuonV2)
+            )
             extra_kwargs = optimizer_kwargs.pop("extra_kwargs")
-
             if is_muon:
                 optimizer_kwargs.update(extra_kwargs)
                 self.optimizers.append(optimizer_cls(params, model, **optimizer_kwargs))

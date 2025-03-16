@@ -125,8 +125,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # verify batch sizes
         if job_config.training.global_batch_size is None:
-            job_config.training.global_batch_size = \
+            job_config.training.global_batch_size = (
                 job_config.training.batch_size * dp_degree
+            )
         assert job_config.training.global_batch_size > 0
         assert (
             job_config.training.global_batch_size
@@ -138,9 +139,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"% ({job_config.training.batch_size} * {dp_degree}) != 0)"
         )
 
-        self.gradient_accumulation_steps = (
-            job_config.training.global_batch_size
-            // (job_config.training.batch_size * dp_degree)
+        self.gradient_accumulation_steps = job_config.training.global_batch_size // (
+            job_config.training.batch_size * dp_degree
         )
         assert self.gradient_accumulation_steps > 0
 
@@ -180,8 +180,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if job_config.model.vocab_size_multiple_of:
             vocab_divisor = job_config.model.vocab_size_multiple_of
             model_config.vocab_size = int(
-                math.ceil(model_config.vocab_size / vocab_divisor)
-                * vocab_divisor
+                math.ceil(model_config.vocab_size / vocab_divisor) * vocab_divisor
             )
             logger.info(
                 f"Padded vocab size from {tokenizer.n_words} to {model_config.vocab_size}."
@@ -416,9 +415,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 if isinstance(output, tuple):
                     pred = output[0]
                     aux_loss = output[1]
+                    moe_routing_entropy = output[2] if len(output) > 2 else None
                 else:
                     pred = output
-                    aux_loss = None
+                    aux_loss, moe_routing_entropy = None, None
+
                 loss = self.train_spec.loss_fn(pred, labels)
                 if aux_loss is not None:
                     loss += aux_loss / self.gradient_accumulation_steps
@@ -427,7 +428,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 # need to free to before bwd to avoid peaking memory
                 del pred
                 loss.backward()
-        return loss, aux_loss
+        return loss, aux_loss, moe_routing_entropy
 
     def train_step(self):
         self.optimizers.zero_grad()
@@ -439,11 +440,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         parallel_dims = self.parallel_dims
 
         for microbatch in range(self.gradient_accumulation_steps):
+            data_iterator = iter(self.dataloader)
             inputs, labels = self.next_batch(data_iterator)
-            loss, aux_loss = self.batch_backward(inputs, labels)
+            loss, aux_loss, moe_routing_entropy = self.batch_backward(inputs, labels)
             self.metrics_processor.accumulated_losses.append(loss.detach())
             if aux_loss is not None:
-                self.metrics_processor.accumulated_aux_losses.append(loss.detach())
+                self.metrics_processor.accumulated_aux_losses.append(aux_loss.detach())
+                self.metrics_processor.accumulated_moe_routing_entropy.append(
+                    moe_routing_entropy
+                )
 
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in model_parts for p in m.parameters()],
@@ -458,8 +463,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         loss = torch.sum(torch.stack(self.metrics_processor.accumulated_losses))
         self.metrics_processor.accumulated_losses.clear()
         if len(self.metrics_processor.accumulated_aux_losses) > 0:
-            aux_loss = torch.sum(torch.stack(self.metrics_processor.accumulated_aux_losses))
+            aux_loss = torch.sum(
+                torch.stack(self.metrics_processor.accumulated_aux_losses)
+            )
+            moe_routing_entropy = torch.sum(
+                torch.stack(self.metrics_processor.accumulated_moe_routing_entropy)
+            )
             self.metrics_processor.accumulated_aux_losses.clear()
+            self.metrics_processor.accumulated_moe_routing_entropy.clear()
 
         # log metrics
         if not self.metrics_processor.should_log(self.step):
@@ -477,33 +488,41 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             )
             if aux_loss is not None:
                 aux_loss = dist_utils.dist_mean(aux_loss, world_mesh["dp_cp"])
+                moe_routing_entropy = dist_utils.dist_mean(
+                    moe_routing_entropy, world_mesh["dp_cp"]
+                )
         else:
             global_avg_loss = global_max_loss = loss.item()
 
         extra_log_data = {
             "optim/grad_norm": grad_norm,
         }
+        extra_print_data = f" gradnorm: {grad_norm:7.4f} "
         if aux_loss is not None:
             extra_log_data["loss_metrics/aux_loss"] = aux_loss
-
-        extra_print_data = (
-            f"  {color.green}gradnorm: {grad_norm:7.4f}{color.reset}"
-        )
+            extra_log_data["loss_metrics/moe_routing_entropy"] = moe_routing_entropy
+            extra_print_data += (
+                f" aux_loss: {aux_loss:.3f} routing_entropy: {moe_routing_entropy:.3f}"
+            )
 
         self.metrics_processor.log(
-            self.step, global_avg_loss, global_max_loss, extra_log_data, extra_print_data,
+            self.step,
+            global_avg_loss,
+            global_max_loss,
+            extra_log_data,
+            extra_print_data,
         )
 
     @record
     def train(self):
         # train loop
         job_config = self.job_config
-        with maybe_enable_profiling(
-            job_config, global_step=self.step
-        ) as torch_profiler, maybe_enable_memory_snapshot(
-            job_config, global_step=self.step
-        ) as memory_profiler:
-            data_iterator = iter(self.dataloader)
+        with (
+            maybe_enable_profiling(job_config, global_step=self.step) as torch_profiler,
+            maybe_enable_memory_snapshot(
+                job_config, global_step=self.step
+            ) as memory_profiler,
+        ):
             while self.step < job_config.training.steps:
                 self.step += 1
                 self.gc_handler.run(self.step)

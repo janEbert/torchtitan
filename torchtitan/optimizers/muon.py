@@ -84,22 +84,17 @@ class Muon(torch.optim.Optimizer):
         self.fsdp_enabled = dp_mesh is not None
         self.dp_mesh = dp_mesh  # DeviceMesh for DP communication
 
-        muon_params = [
-            p
-            for name, p in model.named_parameters()
-            if p.ndim >= 2 and "embed_tokens" not in name and "lm_head" not in name
-        ]
-
-        adamw_params = [
-            p
-            for name, p in model.named_parameters()
-            if not (
-                p.ndim >= 2 and "embed_tokens" not in name and "lm_head" not in name
-            )
-        ]
         print(
-            f"Muon optimizer is enabled with dp_mesh={dp_mesh} | type={type(dp_mesh)}"
+            f"Muon optimizer is enabled with dp_mesh={dp_mesh} | fsdp_enabled={self.fsdp_enabled}"
         )
+
+        muon_params, adamw_params = [], []
+
+        for name, p in model.named_parameters():
+            if p.ndim >= 2 and "embed_tokens" not in name and "lm_head" not in name:
+                muon_params.append(p)
+            else:
+                adamw_params.append(p)
 
         defaults = dict(
             lr=lr,
@@ -137,61 +132,32 @@ class Muon(torch.optim.Optimizer):
         if not self.fsdp_enabled:
             return g  # No sharding, return the original gradient
 
-        if not isinstance(g, DTensor):
-            raise RuntimeError(
-                "Expected gradient to be a DTensor, but got a regular tensor."
-            )
+        assert isinstance(g, DTensor), "Expected gradient to be a DTensor"
 
-        # Ensure g is in the correct mesh
-        if g.device_mesh != self.dp_mesh:
-            raise RuntimeError(
-                f"Gradient tensor's DeviceMesh ({g.device_mesh.mesh_dim_names}) "
-                f"does not match optimizer's DeviceMesh ({self.dp_mesh.mesh_dim_names})."
-            )
-
-        # Convert local gradients into a DTensor replicated across data parallel ranks
-        replicated_grad = DTensor.from_local(
-            g.to_local(), self.dp_mesh, placements=[Replicate()]
-        )
-
+        replicated_grad = g.redistribute(
+            placements=[Replicate()] * g.device_mesh.ndim
+        )  # make sure all rank has the same shape
         return replicated_grad
 
-    def get_shard(self, u, rank=None, world_size=None):
+    def shard_grad(self, u):
+        """Extracts the correct shard for the current rank from a replicated DTensor."""
         if not self.fsdp_enabled:
             return u
-        """Extracts the correct shard for this rank, ensuring compatibility with p.data."""
-        if rank is None:
-            rank = dist.get_rank()
-        if world_size is None:
-            world_size = dist.get_world_size()
 
-        num_rows, num_cols = u.shape  # Get full shape of u
-        shard_size = num_rows // world_size  # Number of rows per rank
+        return u.redistribute(placements=[Shard(0)])
 
-        # start_idx = rank * shard_size
-        # end_idx = (rank + 1) * shard_size if rank != world_size - 1 else num_rows
-        # Extract the correct shard
-        # local_shard = u.to_local()[start_idx:end_idx, :]
+    def update_momentum(self, p, g, momentum, nesterov):
+        state = self.state[p]
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros_like(g)
+        buf = state["momentum_buffer"]
+        buf.mul_(momentum).add_(g)
+        if nesterov:
+            g = g.add(buf, alpha=momentum)
+        else:
+            g = buf
 
-        local_shards = torch.chunk(u.to_local(), world_size, dim=0)
-        local_shard = (
-            local_shards[rank]
-            if rank < len(local_shards)
-            else torch.zeros_like(local_shards[0])
-        )
-
-        # Ensure the shard shape matches p.data
-        if local_shard.shape[0] != num_rows:
-            pad_size = num_rows - local_shard.shape[0]
-            pad = torch.zeros(
-                (pad_size, num_cols), device=local_shard.device, dtype=local_shard.dtype
-            )
-            local_shard = torch.cat([local_shard, pad], dim=0)
-
-        # Convert back to DTensor with correct Shard placement
-        shard = DTensor.from_local(local_shard, u.device_mesh, placements=[Shard(0)])
-
-        return shard
+        return g
 
     def step(self, closure=None):
         """Perform a single optimization step.
@@ -204,6 +170,8 @@ class Muon(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
 
         for group in self.param_groups:
 
@@ -231,71 +199,91 @@ class Muon(torch.optim.Optimizer):
                 # DISTRIBUTED MUON UPDATE #
                 # Step 1: Gather full gradient across ranks
 
+                # print(f"    -> g.shape={g.to_local().shape} | BEFORE GATHER")
                 g = self.gather_full_grad(g)
+                # print(f"    -> g.shape={g.to_local().shape} | AFTER GATHER")
 
-                # calc update
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-                if group["nesterov"]:
-                    g = g.add(buf, alpha=momentum)
-                else:
-                    g = buf
+                # calc update with momentum
+                g = self.update_momentum(p, g, momentum, group["nesterov"])
+
                 u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
 
                 ############################
                 # DISTRIBUTED MUON UPDATE #
                 # Step 2: Extract the correct shard for this rank
-                u = self.get_shard(u)
-
-                # scale update
-                adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
-
-                # apply weight decay
-                p.data.mul_(1 - lr * wd)
+                u = self.shard_grad(u)
 
                 if u.shape != p.data.shape:
                     raise RuntimeError(
                         f"Shape mismatch: u.shape={u.shape}, p.data.shape={p.data.shape}"
                     )
 
+                # apply weight decay
+                p.data.mul_(1 - lr * wd)
+
                 # apply update
-                p.data.add_(u, alpha=-adjusted_lr)
+                p.data.add_(u, alpha=-lr)
 
-            ############################
-            #       AdamW backup       #
-            ############################
+        ############################
+        #       AdamW backup       #
+        ############################
 
-            params = [p for p in group["params"] if not self.state[p]["use_muon"]]
+        self.update_adamw()
+
+        return loss
+
+    def update_adamw(
+        self,
+    ):
+        ############################
+        #       AdamW backup       #
+        ############################
+        for group in self.param_groups:
+            # Get all parameters that don't use muon and have gradients
+            params = [
+                p
+                for p in group["params"]
+                if not self.state[p]["use_muon"] and p.grad is not None
+            ]
+
+            if not params:
+                continue
+
             lr = group["lr"]
             beta1, beta2 = group["adamw_betas"]
             eps = group["adamw_eps"]
             weight_decay = group["wd"]
 
+            # Process parameters one by one - simple, reliable approach
             for p in params:
                 g = p.grad
-                if g is None:
-                    continue
                 state = self.state[p]
+
+                # Initialize state if needed
                 if "step" not in state:
                     state["step"] = 0
-                    state["moment1"] = torch.zeros_like(g)
-                    state["moment2"] = torch.zeros_like(g)
+                    state["moment1"] = torch.zeros_like(g, device=p.device)
+                    state["moment2"] = torch.zeros_like(g, device=p.device)
+
                 state["step"] += 1
                 step = state["step"]
+
+                # Get momentum buffers
                 buf1 = state["moment1"]
                 buf2 = state["moment2"]
-                buf1.lerp_(g, 1 - beta1)
-                buf2.lerp_(g.square(), 1 - beta2)
 
-                g = buf1 / (eps + buf2.sqrt())
+                # Update momentum buffers - safer than lerp
+                buf1.mul_(beta1).add_(g, alpha=1 - beta1)
+                buf2.mul_(beta2).add_(
+                    g * g, alpha=1 - beta2
+                )  # More reliable than g.square()
 
+                # Compute bias corrections
                 bias_correction1 = 1 - beta1**step
                 bias_correction2 = 1 - beta2**step
-                scale = bias_correction1 / bias_correction2**0.5
-                p.data.mul_(1 - lr * weight_decay)
-                p.data.add_(g, alpha=-lr / scale)
+                step_size = lr / (bias_correction1 / math.sqrt(bias_correction2))
 
-        return loss
+                # Apply weight decay and update parameters
+                with torch.no_grad():
+                    p.data.mul_(1 - lr * weight_decay)
+                    p.data.addcdiv_(buf1, buf2.sqrt().add_(eps), value=-step_size)

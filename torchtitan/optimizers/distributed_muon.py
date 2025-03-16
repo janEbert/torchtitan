@@ -37,6 +37,18 @@ def zeropower_via_newtonschulz5(G, steps):
     return X
 
 
+class DTensorHandle:
+    def __init__(self, dtensor):
+        self.dtensor = dtensor
+        # Store the local tensor to avoid extra copies
+
+    def wait(self):
+        # Create a replicated DTensor
+        # In a real implementation, this would be an async operation
+        # that we're waiting for here
+        return self.dtensor.full_tensor()
+
+
 class DistributedMuon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
@@ -84,22 +96,17 @@ class DistributedMuon(torch.optim.Optimizer):
         self.fsdp_enabled = dp_mesh is not None
         self.dp_mesh = dp_mesh  # DeviceMesh for DP communication
 
-        muon_params = [
-            p
-            for name, p in model.named_parameters()
-            if p.ndim >= 2 and "embed_tokens" not in name and "lm_head" not in name
-        ]
-
-        adamw_params = [
-            p
-            for name, p in model.named_parameters()
-            if not (
-                p.ndim >= 2 and "embed_tokens" not in name and "lm_head" not in name
-            )
-        ]
         print(
-            f"Muon optimizer is enabled with dp_mesh={dp_mesh} | type={type(dp_mesh)}"
+            f"Muon optimizer is enabled with dp_mesh={dp_mesh} | fsdp_enabled={self.fsdp_enabled}"
         )
+
+        muon_params, adamw_params = [], []
+
+        for name, p in model.named_parameters():
+            if p.ndim >= 2 and "embed_tokens" not in name and "lm_head" not in name:
+                muon_params.append(p)
+            else:
+                adamw_params.append(p)
 
         defaults = dict(
             lr=lr,
@@ -124,37 +131,119 @@ class DistributedMuon(torch.optim.Optimizer):
             # Do not use Muon for parameters in adamw_params
             self.state[p]["use_muon"] = False
 
-    def adjust_lr_for_muon(self, lr, param_shape):
-        A, B = param_shape[:2]
-        # We adjust the learning rate and weight decay based on the size of the parameter matrix
-        # as describted in the paper
-        adjusted_ratio = 0.2 * math.sqrt(max(A, B))
-        adjusted_lr = lr * adjusted_ratio
-        return adjusted_lr
-
     def gather_full_grad(self, g):
         """Gathers the full gradient across all distributed processes using DTensor."""
+        """and conver the gathered tensor to DTensor"""
         if not self.fsdp_enabled:
             return g  # No sharding, return the original gradient
 
-        if not isinstance(g, DTensor):
-            raise RuntimeError(
-                "Expected gradient to be a DTensor, but got a regular tensor."
-            )
-
-        # Ensure g is in the correct mesh
-        if g.device_mesh != self.dp_mesh:
-            raise RuntimeError(
-                f"Gradient tensor's DeviceMesh ({g.device_mesh.mesh_dim_names}) "
-                f"does not match optimizer's DeviceMesh ({self.dp_mesh.mesh_dim_names})."
-            )
-
-        # Convert local gradients into a DTensor replicated across data parallel ranks
-        replicated_grad = DTensor.from_local(
-            g.to_local(), self.dp_mesh, placements=[Replicate()]
-        )
-
+        assert isinstance(g, DTensor), "Expected gradient to be a DTensor"
+        replicated_grad = g.redistribute(
+            placements=[Replicate()] * g.device_mesh.ndim
+        )  # make sure all rank has the same shape
         return replicated_grad
+
+    def shard_grad(self, u):
+        """Shards the update tensor after Newton-Schulz iteration."""
+        if not self.fsdp_enabled:
+            return u
+
+        assert isinstance(u, DTensor), "Expected gradient to be a DTensor"
+
+        sharded_update = u.redistribute(placements=[Shard(0)])
+        return sharded_update
+
+    def update_momentum(self, p, g, momentum, nesterov):
+        state = self.state[p]
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros_like(g)
+        buf = state["momentum_buffer"]
+        buf.mul_(momentum).add_(g)
+        if nesterov:
+            g = g.add(buf, alpha=momentum)
+        else:
+            g = buf
+
+        return g
+
+    def step(self, closure=None):
+        """Perform a single optimization step.
+
+        Args:
+            closure (Callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        """
+        So, we have [params] more than world size in general.
+        Hence, we distribute the params across the world_size.
+        Each rank will have a subset of the params = len(params) // world_size
+        """
+
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+
+        for group in self.param_groups:
+            ############################
+            #           Muon           #
+            ############################
+
+            params = [p for p in group["params"] if self.state[p]["use_muon"]]
+            # import pdb; pdb.set_trace()
+            lr = group["lr"]
+            wd = group["wd"]
+            momentum = group["momentum"]
+
+            bucket_size = len(params) // world_size
+            start_idx = rank * bucket_size
+            end_idx = (rank + 1) * bucket_size if rank < world_size - 1 else len(params)
+            # bucket_params = params[start_idx:end_idx]
+
+            for group_idx, p in enumerate(params):
+                g = p.grad
+                if g is None:
+                    continue
+                if g.ndim > 2:
+                    g = g.view(g.size(0), -1)
+                assert g is not None
+
+                if group_idx < start_idx or group_idx >= end_idx:
+                    g = self.gather_full_grad(torch.zeros_like(p.grad))
+                    continue
+
+                ############################
+                # DISTRIBUTED MUON UPDATE #
+                # Step 1: Gather full gradient across ranks
+                g = self.gather_full_grad(p.grad)
+
+                # calc update with momentum
+                g = self.update_momentum(p, g, momentum, group["nesterov"])
+
+                u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                # u = torch.zeros_like(g)  # easier for debugging
+
+                ############################
+                # DISTRIBUTED MUON UPDATE #
+                # Step 2: Extract the correct shard for this rank
+                u = self.shard_grad(u)
+
+                if u.shape != p.data.shape:
+                    raise RuntimeError(
+                        f"Shape mismatch: u.shape={u.shape}, p.data.shape={p.data.shape}"
+                    )
+
+                # apply weight decay
+                p.data.mul_(1 - lr * wd)
+
+                # apply update
+                p.data.add_(u, alpha=-lr)
+
+        self.update_adamw()
+        return loss
 
     def update_adamw(
         self,
@@ -211,138 +300,3 @@ class DistributedMuon(torch.optim.Optimizer):
                 with torch.no_grad():
                     p.data.mul_(1 - lr * weight_decay)
                     p.data.addcdiv_(buf1, buf2.sqrt().add_(eps), value=-step_size)
-
-    def step(self, closure=None):
-        """Perform a single optimization step.
-
-        Args:
-            closure (Callable, optional): A closure that reevaluates the model
-                and returns the loss.
-        """
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        """
-        So, we have [params] more than world size in general.
-        Hence, we distribute the params across the world_size.
-        Each rank will have a subset of the params = len(params) // world_size
-        """
-
-        world_size = dist.get_world_size()
-        rank = dist.get_rank()
-
-        for group in self.param_groups:
-            ############################
-            #           Muon           #
-            ############################
-
-            params = [p for p in group["params"] if self.state[p]["use_muon"]]
-            # import pdb; pdb.set_trace()
-            lr = group["lr"]
-            wd = group["wd"]
-            momentum = group["momentum"]
-
-            bucket_size = len(params) // world_size
-            start_idx = rank * bucket_size
-            end_idx = (rank + 1) * bucket_size if rank < world_size - 1 else len(params)
-
-            bucket_params = params[start_idx:end_idx]
-
-            # generate weight updates in distributed fashion
-            for idx, p in enumerate(bucket_params):
-
-                # sanity check
-                g = p.grad
-                if g is None:
-                    continue
-                if g.ndim > 2:
-                    g = g.view(g.size(0), -1)
-                assert g is not None
-
-                ############################
-                # DISTRIBUTED MUON UPDATE #
-                # Step 1: Gather full gradient across ranks
-
-                # calc update
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-                if group["nesterov"]:
-                    g = g.add(buf, alpha=momentum)
-                else:
-                    g = buf
-
-                g = self.gather_full_grad(g)
-
-                u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
-
-                ############################
-                # DISTRIBUTED MUON UPDATE #
-                # Step 2: Extract the correct shard for this rank
-
-                # Convert `u` to local tensor if it’s a DTensor
-                if isinstance(u, DTensor):
-                    u_local = u.to_local()
-                else:
-                    u_local = u
-
-                # Ensure `u_local` is evenly split across GPUs
-                split_size = u_local.shape[0] // world_size
-                remainder = u_local.shape[0] % world_size
-                if remainder > 0:
-                    pad = torch.zeros(
-                        (world_size - remainder, u_local.shape[1]),
-                        device=u_local.device,
-                        dtype=u_local.dtype,
-                    )
-                    u_local = torch.cat([u_local, pad], dim=0)
-
-                # Now safely split into equal-sized chunks
-                u_chunks = list(torch.split(u_local, split_size, dim=0))
-                # Allocate buffers for received `u` shards
-                u_shards = [torch.zeros_like(u_chunks[0]) for _ in range(world_size)]
-                # Use `all_to_all()` to correctly swap updates between GPUs
-
-                # dist.all_to_all(u_shards, u_chunks)
-
-                work = dist.all_to_all(u_shards, u_chunks, async_op=True)
-                work.wait()  # Synchronize before using u_shards
-                # dist.reduce_scatter(
-                #     u_local, u_chunks, op=dist.ReduceOp.SUM, async_op=True
-                # )
-
-                # Reconstruct correct `u` for this rank
-                u = torch.cat(u_shards, dim=0)  # Now, each GPU has the correct update
-
-                # Convert back to DTensor if needed
-                if isinstance(p.data, DTensor):
-                    u = DTensor.from_local(u, p.data.device_mesh, placements=[Shard(0)])
-
-                ############################
-                # Scale update
-                adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
-
-                # apply weight decay
-                p.data.mul_(1 - lr * wd)
-
-                if u.shape != p.data.shape:
-                    raise RuntimeError(
-                        f"Shape mismatch: u.shape={u.shape}, p.data.shape={p.data.shape}"
-                    )
-
-                # apply update
-                p.data.add_(u, alpha=-adjusted_lr)
-
-                # ok question here is, other ranks does not have the updated p.data
-                # so, we need to broadcast the updated p.data to all ranks
-
-        # For easier debug, we separate the AdamW optimizer
-        ############################
-        #       AdamW backup       #
-        ############################
-        self.update_adamw()
-        return loss

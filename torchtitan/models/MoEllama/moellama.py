@@ -57,6 +57,13 @@ class Gate(nn.Module):
         self.bias_update_speed = bias_update_speed
         # Step size for updating bias dynamically
 
+        # Store indices for bias update
+        self._indices_for_update = None
+
+        # Register a hook to update bias after backward pass
+        if self.bias is not None:
+            self.register_full_backward_hook(self._backward_hook)
+
     def forward(self, x: torch.Tensor, update_bias: bool = False) -> torch.Tensor:
         """
         Args:
@@ -77,12 +84,22 @@ class Gate(nn.Module):
 
         # Extract and normalize weights
         weights = scores.gather(-1, indices)
-        weights = weights / weights.sum(dim=-1, keepdim=True)
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
 
         if update_bias and self.bias is not None:
-            self.update_bias(indices)
+            self._indices_for_update = indices.detach()
+
+        # if update_bias and self.bias is not None:
+        #     self.update_bias(indices)
 
         return weights.type_as(x), indices, scores
+
+    def _backward_hook(self, module, grad_input, grad_output):
+        """Hook that runs after the backward pass completes"""
+        if self._indices_for_update is not None:
+            self.update_bias(self._indices_for_update)
+            self._indices_for_update = None
+        return None
 
     def update_bias(self, indices: torch.Tensor):
         """
@@ -163,9 +180,9 @@ class MoE(nn.Module):
         Saying the dense model have the 'hidden_size' of 1024, 
         Then "actual_dim * activate_experts = hidden_size" should be satisfied.
         """
-        assert (
-            shared_experts > 0
-        ), "when moved from my libs to this one, something goes wrong for shared_experts=0"
+        # assert (
+        #     shared_experts > 0
+        # ), "when moved from my libs to this one, something goes wrong for shared_experts=0"
         if match_dim_with_dense:
             total_activate_experts = shared_experts + activate_experts
             ratio = total_activate_experts / (n_routed_experts + shared_experts)
@@ -528,15 +545,17 @@ class Transformer(nn.Module, ModelProtocol):
         """
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
-        total_moe_aux_loss = 0
+        total_moe_aux_loss, total_moe_routing_entropy = 0.0, 0.0
 
         for layer in self.layers.values():
             h, moe_aux_loss, routing_entropy = layer(h, self.freqs_cis)
             total_moe_aux_loss += moe_aux_loss
 
+            total_moe_routing_entropy += routing_entropy
+
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h
-        return output, total_moe_aux_loss
+        return output, total_moe_aux_loss, total_moe_routing_entropy
 
     @classmethod
     def from_model_args(cls, model_args: MoEModelArgs) -> "Transformer":
