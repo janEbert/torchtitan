@@ -1,5 +1,7 @@
 import os
 import torch
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
 __all__ = [
     'Scion',
@@ -55,12 +57,41 @@ zeropower_backends = dict(svd=zeropower_via_svd,
 class Scion(torch.optim.Optimizer):
 
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, eps=1e-7, norm_factor='none',
-                 backend='newtonschulz5', backend_steps=5):
+                 backend='newtonschulz5', backend_steps=5, dp_mesh=None):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, 
                         eps=eps, norm_factor=norm_factor, 
                         backend=backend, backend_steps=backend_steps)
+        self.fsdp_enabled = dp_mesh is not None
+        self.dp_mesh = dp_mesh  # DeviceMesh for DP communication
+        print(
+            f"Scion optimizer is enabled with dp_mesh={dp_mesh} | fsdp_enabled={self.fsdp_enabled}"
+        )
         super().__init__(params, defaults)
 
+    def gather_full_grad(self, g):
+        """Gathers the full gradient across all distributed processes using DTensor."""
+        if not self.fsdp_enabled:
+            return g  # No sharding, return the original gradient
+
+        assert isinstance(g, DTensor), "Expected gradient to be a DTensor"
+
+        g_bf16 = g.to(dtype=torch.bfloat16)
+        replicated_grad = g_bf16.redistribute(
+            placements=[Replicate()] * g.device_mesh.ndim
+        )  # make sure all rank has the same shape
+
+        return replicated_grad
+    
+    def shard_grad(self, g):
+        """Extracts the correct shard for the current rank from a replicated DTensor."""
+        if not self.fsdp_enabled:
+            return g
+        
+        g_float = g.to(dtype=torch.float32)
+        g_sharded = g_float.redistribute(placements=[Shard(0)] * self.dp_mesh.ndim)
+        
+        return g_sharded
+    
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -81,6 +112,11 @@ class Scion(torch.optim.Optimizer):
             for p in group['params']:
                 g = self._compute_grad(p, **param_kwargs)
                 if g is not None:
+                    g = self.shard_grad(g)
+                    if g.shape != p.data.shape:
+                        raise RuntimeError(
+                            f"Shape mismatch: g.shape={g.shape}, p.data.shape={p.data.shape}"
+                        )
                     p.data.add_(g, alpha=-lr)
                     self.state[p]['step'] += 1
 
@@ -91,6 +127,7 @@ class Scion(torch.optim.Optimizer):
         g = p.grad
         if g is None or not p.requires_grad:
             return
+        g = self.gather_full_grad(g)
 
         # State initialization
         state = self.state[p]
