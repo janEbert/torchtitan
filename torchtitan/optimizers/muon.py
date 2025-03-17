@@ -131,24 +131,33 @@ class Muon(torch.optim.Optimizer):
         )  # make sure all rank has the same shape
         return replicated_grad
 
-    def shard_grad(self, u):
+    def shard_grad(self, u, rank, world_size):
         """Extracts the correct shard for the current rank from a replicated DTensor."""
         if not self.fsdp_enabled:
             return u
 
-        return u.redistribute(placements=[Shard(0)])
+        chunks = list(torch.chunk(u, world_size, dim=0))  # Split across GPUs
+        return chunks[rank]
+        # return u.redistribute(placements=[Shard(0)])
 
-    def update_momentum(self, p, g, momentum, nesterov):
+    def update_momentum(self, p, g, momentum):
         state = self.state[p]
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros_like(g)
         buf = state["momentum_buffer"]
         buf.mul_(momentum).add_(g)
-        if nesterov:
-            g = g.add(buf, alpha=momentum)
+        # if nesterov:
+        #     g = g.add(buf, alpha=momentum)
+        # else:
+        #     g = buf
+        # return g
+
+    def get_gradient_from_state(self, p, nestroev=False, momentum=0):
+        buf = self.state[p]["momentum_buffer"]
+        if nestroev:
+            g = p.grad.add(buf, alpha=momentum)
         else:
             g = buf
-
         return g
 
     def step(self, closure=None):
@@ -165,51 +174,56 @@ class Muon(torch.optim.Optimizer):
         world_size = dist.get_world_size()
         rank = dist.get_rank()
 
+        # we first update the momentum and then apply the update
         for group in self.param_groups:
-
-            ############################
-            #           Muon           #
-            ############################
-
-            params = [p for p in group["params"] if self.state[p]["use_muon"]]
-            # import pdb; pdb.set_trace()
-            lr = group["lr"]
-            wd = group["wd"]
-            momentum = group["momentum"]
-
-            # generate weight updates in distributed fashion
-            for p in params:
+            for p in group["params"]:
                 # sanity check
                 g = p.grad
-                if g is None:
+                if g is None or self.state[p]["use_muon"] is False:
                     continue
                 if g.ndim > 2:
                     g = g.view(g.size(0), -1)
-                assert g is not None
+                self.update_momentum(p, g, group["momentum"])
 
+        # then its the actual muon update
+        for group in self.param_groups:
+            lr = group["lr"]
+            wd = group["wd"]
+            momentum = group["momentum"]
+            nestroev = group["nesterov"]
+            ns_steps = group["ns_steps"]
+
+            # generate weight updates in distributed fashion
+            for p in group["params"]:
+                # sanity check
+                if p.grad is None or self.state[p]["use_muon"] is False:
+                    continue
+                g = self.get_gradient_from_state(p, nestroev, momentum)
                 ############################
-                # DISTRIBUTED MUON UPDATE #
                 # Step 1: Gather full gradient across ranks
-                g = self.update_momentum(p, g, momentum, group["nesterov"])
-                # print(f"    -> g.shape={g.to_local().shape} | BEFORE GATHER")
-                g = self.gather_full_grad(g)
-                # print(f"    -> g.shape={g.to_local().shape} | AFTER GATHER")
-
-                # calc update with momentum
-
-                u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
-                # cast u back to g's dtype
+                full_g = self.gather_full_grad(g)
+                if self.fsdp_enabled:
+                    full_g = full_g.to_local()
 
                 ############################
-                # DISTRIBUTED MUON UPDATE #
-                # Step 2: Extract the correct shard for this rank
-                u = self.shard_grad(u)
+                # Step 2: Run the Newton-Schulz iteration
+                u = zeropower_via_newtonschulz5(full_g, steps=ns_steps)
 
-                # apply weight decay
-                p.data.mul_(1 - lr * wd)
+                ############################
+                # Step 3: Extract the correct shard for this rank
+                u = self.shard_grad(u, rank, world_size)
 
-                # apply update
-                p.data.add_(u, alpha=-lr)
+                # Convert back to DTensor with replicated placement
+                if self.fsdp_enabled:
+                    u = DTensor.from_local(
+                        u, device_mesh=g.device_mesh, placements=g.placements
+                    )
+
+                ############################
+                # Step 4: update the parameter
+                with torch.no_grad():
+                    # apply weight decay and update parameters
+                    p.data.mul_(1 - lr * wd).add_(u, alpha=-lr)
 
         ############################
         #       AdamW backup       #
