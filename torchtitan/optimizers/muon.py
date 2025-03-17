@@ -19,7 +19,6 @@ def zeropower_via_newtonschulz5(G, steps):
     """
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750, 2.0315)
-    original_dtype = G.dtype
     X = G.bfloat16()
     if G.size(0) > G.size(1):
         X = X.T
@@ -35,7 +34,7 @@ def zeropower_via_newtonschulz5(G, steps):
 
     if G.size(0) > G.size(1):
         X = X.T
-    return X.to(original_dtype)
+    return X
 
 
 class Muon(torch.optim.Optimizer):
@@ -191,13 +190,12 @@ class Muon(torch.optim.Optimizer):
                 ############################
                 # DISTRIBUTED MUON UPDATE #
                 # Step 1: Gather full gradient across ranks
-
+                g = self.update_momentum(p, g, momentum, group["nesterov"])
                 # print(f"    -> g.shape={g.to_local().shape} | BEFORE GATHER")
                 g = self.gather_full_grad(g)
                 # print(f"    -> g.shape={g.to_local().shape} | AFTER GATHER")
 
                 # calc update with momentum
-                g = self.update_momentum(p, g, momentum, group["nesterov"])
 
                 u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
                 # cast u back to g's dtype

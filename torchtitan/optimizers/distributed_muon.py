@@ -132,28 +132,20 @@ class DistributedMuon(torch.optim.Optimizer):
         )  # make sure all rank has the same shape
         return replicated_grad
 
-    def shard_grad(self, u):
+    def shard_grad(self, u, world_size, rank, src_rank):
         """Shards the update tensor after Newton-Schulz iteration."""
         if not self.fsdp_enabled:
             dist.all_reduce(u, op=dist.ReduceOp.SUM)
             return u
 
-        assert isinstance(u, DTensor), "Expected gradient to be a DTensor"
+        chunks = list(torch.chunk(u, world_size, dim=0))  # Split across GPUs
+        local_chunk = torch.zeros_like(chunks[0])  # Allocate space for local chunk
 
-        full_update = u.to_local()
-        dist.all_reduce(full_update, op=dist.ReduceOp.SUM)
+        scatter_list = chunks if rank == src_rank else None
 
-        # Convert back to DTensor with replicated placement
-        full_update_dt = DTensor.from_local(
-            full_update,
-            device_mesh=u.device_mesh,
-            placements=[Replicate()] * u.device_mesh.ndim,
-        )
+        dist.scatter(local_chunk, scatter_list=scatter_list, src=src_rank)
 
-        # Now re-shard the update to match the parameter's sharding
-        sharded_update = full_update_dt.redistribute(placements=[Shard(0)])
-
-        return sharded_update
+        return local_chunk
 
     def update_momentum(self, p, g, momentum, nesterov):
         state = self.state[p]
@@ -199,10 +191,14 @@ class DistributedMuon(torch.optim.Optimizer):
             lr = group["lr"]
             wd = group["wd"]
             momentum = group["momentum"]
+            ns_steps = group["ns_steps"]
+            nesterov = group["nesterov"]
 
-            bucket_size = len(params) // world_size
+            bucket_size = (len(params) + world_size - 1) // world_size
+
             start_idx = rank * bucket_size
-            end_idx = (rank + 1) * bucket_size if rank < world_size - 1 else len(params)
+            end_idx = min(start_idx + bucket_size, len(params))
+
             # bucket_params = params[start_idx:end_idx]
 
             for group_idx, p in enumerate(params):
@@ -216,19 +212,24 @@ class DistributedMuon(torch.optim.Optimizer):
                 ############################
                 # DISTRIBUTED MUON UPDATE #
                 # Step 1: Gather full gradient across ranks
-                g = self.gather_full_grad(p.grad)
+                g = self.update_momentum(p, g, momentum, nesterov)
+                g = self.gather_full_grad(p.grad).to_local()
 
                 if group_idx < start_idx or group_idx >= end_idx:
                     # calc update with momentum
                     u = torch.zeros_like(g)
                 else:
-                    g = self.update_momentum(p, g, momentum, group["nesterov"])
-                    u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                    u = zeropower_via_newtonschulz5(g, steps=ns_steps)
 
                 ############################
                 # DISTRIBUTED MUON UPDATE #
                 # Step 2: Extract the correct shard for this rank
-                u = self.shard_grad(u)
+                u = self.shard_grad(u, world_size, rank, group_idx // bucket_size)
+
+                # Convert back to DTensor with replicated placement
+                u = DTensor.from_local(
+                    u, device_mesh=p.device_mesh, placements=p.placements
+                )
 
                 # apply weight decay
                 p.data.mul_(1 - lr * wd)
