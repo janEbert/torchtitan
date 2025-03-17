@@ -35,10 +35,11 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     #     (2.8769, -3.1427, 1.2046),
     #     (2.8366, -3.0525, 1.2012),
     # ]:
+    original_dtype = G.dtype
     X = G.bfloat16()
-    X /= (X.norm() + eps) # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
+    X /= (X.norm() + eps) # ensure top singular value <= 1
 
     for _ in range(steps):
         A = X @ X.T
@@ -48,7 +49,7 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     if G.size(0) > G.size(1):
         X = X.T
 
-    return X
+    return X.to(original_dtype)
 
 zeropower_backends = dict(svd=zeropower_via_svd, 
                             newtonschulz5=zeropower_via_newtonschulz5, 
@@ -75,11 +76,9 @@ class Scion(torch.optim.Optimizer):
 
         assert isinstance(g, DTensor), "Expected gradient to be a DTensor"
 
-        g_bf16 = g.to(dtype=torch.bfloat16)
-        replicated_grad = g_bf16.redistribute(
+        replicated_grad = g.redistribute(
             placements=[Replicate()] * g.device_mesh.ndim
         )  # make sure all rank has the same shape
-
         return replicated_grad
     
     def shard_grad(self, g):
@@ -87,10 +86,7 @@ class Scion(torch.optim.Optimizer):
         if not self.fsdp_enabled:
             return g
         
-        g_float = g.to(dtype=torch.float32)
-        g_sharded = g_float.redistribute(placements=[Shard(0)] * self.dp_mesh.ndim)
-        
-        return g_sharded
+        return g.redistribute(placements=[Shard(0)])
     
     @torch.no_grad()
     def step(self, closure=None):
@@ -127,7 +123,6 @@ class Scion(torch.optim.Optimizer):
         g = p.grad
         if g is None or not p.requires_grad:
             return
-        g = self.gather_full_grad(g)
 
         # State initialization
         state = self.state[p]
@@ -141,7 +136,12 @@ class Scion(torch.optim.Optimizer):
         buf.mul_(momentum).add_(g)
         if nesterov:
             g = g.add(buf, alpha=momentum)
+        
+        # Transform gradient with the backend function
+        g = self.gather_full_grad(g)
         g = zeropower_backend(g, steps=backend_steps, eps=eps)
+
+        # Normalize the gradient
         if norm_factor == 'spectral':
             # print('\n\n\n')
             # print('LINEAR, shape: ', g.shape)
