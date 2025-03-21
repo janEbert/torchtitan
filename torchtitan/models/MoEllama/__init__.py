@@ -20,7 +20,13 @@ __all__ = [
 
 moe_llama3_configs = {
     "debugmodel": MoEModelArgs(
-        dim=256, n_layers=8, n_heads=16, rope_theta=500000
+        dim=256,
+        n_layers=8,
+        n_heads=16,
+        rope_theta=500000,
+        shared_experts=1,
+        n_routed_experts=4,
+        activate_experts=1,
     ),
     "8B": MoEModelArgs(
         dim=4096,

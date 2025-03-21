@@ -203,10 +203,12 @@ def apply_tp(
             "feed_forward.w3": colwise_parallel(),
         }
         if isinstance(transformer_block, BitNetTransformerBlock):
-            layer_plan.update({
-                "attention.wo_norm": SequenceParallel(),
-                "feed_forward.w2_norm": SequenceParallel(),
-            })
+            layer_plan.update(
+                {
+                    "attention.wo_norm": SequenceParallel(),
+                    "feed_forward.w2_norm": SequenceParallel(),
+                }
+            )
 
         parallelize_module(
             module=transformer_block,
@@ -264,16 +266,21 @@ def _apply_ac_to_transformer_block(module: nn.Module, ac_config):
             CheckpointPolicy,
             create_selective_checkpoint_contexts,
         )
+
         if isinstance(module, BitNetTransformerBlock):
-            _save_list.update({
-                torch.ops.torchao.scaled_int8_mm.default,
-                torch.ops.aten._int_mm.default,
-                torch.ops.aten.mean.default,
-            })
-            mm_funs.extend([
-                torch.ops.torchao.scaled_int8_mm.default,
-                torch.ops.aten._int_mm.default,
-            ])
+            _save_list.update(
+                {
+                    torch.ops.torchao.scaled_int8_mm.default,
+                    torch.ops.aten._int_mm.default,
+                    torch.ops.aten.mean.default,
+                }
+            )
+            mm_funs.extend(
+                [
+                    torch.ops.torchao.scaled_int8_mm.default,
+                    torch.ops.aten._int_mm.default,
+                ]
+            )
 
         def _get_custom_policy(meta):
             def _custom_policy(ctx, func, *args, **kwargs):
@@ -328,7 +335,9 @@ def apply_compile(model: nn.Module):
     repeated structure. Alternatively one can compile the whole model (after applying DP).
     """
     for layer_id, transformer_block in model.layers.named_children():
-        transformer_block = torch.compile(transformer_block, fullgraph=True)
+        transformer_block = torch.compile(
+            transformer_block,
+        )  # dynamic=True)
         model.layers.register_module(layer_id, transformer_block)
 
     logger.info("Compiling each TransformerBlock with torch.compile")

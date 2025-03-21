@@ -57,6 +57,7 @@ class Gate(nn.Module):
         self.bias_update_speed = bias_update_speed
         # Step size for updating bias dynamically
 
+    @torch.compiler.disable
     def forward(self, x: torch.Tensor, update_bias: bool = False) -> torch.Tensor:
         """
         Args:
@@ -223,21 +224,14 @@ class MoE(nn.Module):
             shared_outputs = torch.stack(
                 [expert(x) for expert in self.shared_experts], dim=0
             )  # (num_shared, B*S, D)
-            shared_outputs = shared_outputs.mean(
-                dim=0
-            )  # Average over shared experts (B*S, D)
+            shared_outputs = shared_outputs.mean(dim=0)
         else:
-            shared_outputs = torch.zeros_like(
-                x,
-            )  # No shared experts, just zero outpu
+            shared_outputs = torch.zeros_like(x)
 
-        # Get routing weights and indices (update bias only during training)
+            # Get routing weights and indices (update bias only during training)
         weights, indices, scores = self.gate(
             x, update_bias=self.training
         )  # (B*S, K), (B*S, K)
-
-        # Prepare output tensor
-        y = torch.zeros_like(x)
 
         # Efficient parallel expert execution
         routed_outputs = torch.zeros_like(x)
@@ -529,10 +523,12 @@ class Transformer(nn.Module, ModelProtocol):
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
         total_moe_aux_loss = 0
+        moe_entropy_per_layer = {}
 
         for layer in self.layers.values():
             h, moe_aux_loss, routing_entropy = layer(h, self.freqs_cis)
             total_moe_aux_loss += moe_aux_loss
+            moe_entropy_per_layer[layer.layer_id] = routing_entropy
 
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h
