@@ -30,6 +30,7 @@ rank_0_only = true
 name = "bit_byte_llama3"
 flavor = "debugmodel"
 norm_type = "rmsnorm" # layernorm / np_layernorm / rmsnorm / np_rmsnorm
+init_std = 1.0
 # tokenizer_path = ???
 # converters = ???
 

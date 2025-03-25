@@ -44,6 +44,7 @@ class TransformerModelArgs(BaseModelArgs):
     # If `True`, then each transformer block init uses its layer ID, and if
     # `False`, each uses the total number of transformer blocks
     depth_init: bool = True
+    init_std: float = 1.0
     norm_type: str = "rmsnorm"
     qk_norm: bool = False
 
@@ -263,10 +264,11 @@ class Attention(nn.Module):
                 eps=model_args.norm_eps,
             )
 
-    def init_weights(self, init_std: float):
-        for linear in (self.wq, self.wk, self.wv):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
+    def init_weights(self, init_std: float, residual_div: float):
+        for linear in (self.wq, self.wk, self.wv, self.wo):
+            nn.init.normal_(linear.weight, mean=0.0, std=init_std)
+        with torch.no_grad():
+            self.wo.weight.div_(residual_div)
 
     def forward(
         self,
@@ -378,11 +380,11 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
-    def init_weights(self, init_std: float):
-        nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
-        for linear in (self.w2, self.w3):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
-
+    def init_weights(self, init_std: float, residual_div: float):
+        for linear in (self.w1, self.w2, self.w3):
+            nn.init.normal_(linear.weight, mean=0.0, std=init_std)
+        with torch.no_grad():
+            self.w2.weight.div_(residual_div)
 
 class TransformerBlock(nn.Module):
     """
@@ -428,10 +430,11 @@ class TransformerBlock(nn.Module):
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
         )
 
+        self.init_std = model_args.init_std / model_args.dim ** 0.5
         if model_args.depth_init:
-            self.weight_init_std = 0.02 / (2 * (self.layer_id + 1)) ** 0.5
+            self.residual_div = (2 * (self.layer_id + 1)) ** 0.5
         else:
-            self.weight_init_std = 0.02 / (2 * self.num_layers) ** 0.5
+            self.residual_div = (2 * self.num_layers) ** 0.5
 
     def forward(
         self,
@@ -456,8 +459,8 @@ class TransformerBlock(nn.Module):
     def init_weights(self):
         for norm in (self.attention_norm, self.ffn_norm):
             norm.reset_parameters()
-        self.attention.init_weights(self.weight_init_std)
-        self.feed_forward.init_weights(self.weight_init_std)
+        self.attention.init_weights(init_std=self.init_std, residual_div=self.residual_div)
+        self.feed_forward.init_weights(init_std=self.init_std, residual_div=self.residual_div)
 
 
 class MTPModule(nn.Module):
@@ -600,21 +603,20 @@ class Transformer(nn.Module, ModelProtocol):
         with torch.device(buffer_device):
             self.freqs_cis = self._precompute_freqs_cis()
         if self.tok_embeddings is not None:
-            nn.init.normal_(self.tok_embeddings.weight)
+            nn.init.normal_(
+                self.tok_embeddings.weight,
+                mean=0.0,
+                std=self.model_args.vocab_size ** -0.5)
         for layer in self.layers.values():
             if layer is not None:
                 layer.init_weights()
         if self.norm is not None:
             self.norm.reset_parameters()
-        final_out_std = self.model_args.dim**-0.5
-        cutoff_factor = 3
         if self.output is not None:
-            nn.init.trunc_normal_(
+            nn.init.normal_(
                 self.output.weight,
                 mean=0.0,
-                std=final_out_std,
-                a=-cutoff_factor * final_out_std,
-                b=cutoff_factor * final_out_std,
+                std=self.model_args.dim ** -1.0,
             )
         if self.model_args.num_mtp_modules > 0:
             for layer in self.mtp_layers.values():

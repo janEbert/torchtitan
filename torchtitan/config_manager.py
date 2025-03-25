@@ -211,6 +211,12 @@ class JobConfig:
             help="Which model config to train",
         )
         self.parser.add_argument(
+            "--model.init_std",
+            type=float,
+            default=1.0,
+            help="Standard deviation multiplier for weight initialization",
+        )
+        self.parser.add_argument(
             "--model.norm_type",
             type=str,
             default="rmsnorm",
