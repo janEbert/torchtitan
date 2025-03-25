@@ -389,7 +389,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         model_parts = self.model_parts
         world_mesh = self.world_mesh
         parallel_dims = self.parallel_dims
-
+        aux_loss = None
+        moe_entropy_per_layer = None
         # apply context parallelism if cp is enabled
         # ensure CP handles the separate freqs_cis buffer for each pp stage
         optional_context_parallel_ctx = (
@@ -428,18 +429,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 assert len(model_parts) == 1
                 output = model_parts[0](inputs)
                 if isinstance(output, tuple):
-                    if len(output) == 2:
-                        pred = output[0]
-                        aux_loss = output[1]
-                    elif len(output) == 3:
-                        pred = output[0]
-                        aux_loss = None
-                    elif len(output) == 4:
-                        pred = output[0]
-                        aux_loss = output[3]
+                    assert len(output) == 3
+                    pred, aux_loss, moe_entropy_per_layer = output
                 else:
                     pred = output
-                    aux_loss = None
                 loss = self.train_spec.loss_fn(pred, labels)
                 if aux_loss is not None:
                     loss += aux_loss / self.gradient_accumulation_steps
@@ -448,7 +441,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 # need to free to before bwd to avoid peaking memory
                 del pred
                 loss.backward()
-        return loss, aux_loss
+        return loss, aux_loss, moe_entropy_per_layer
 
     def train_step(self, data_iterator: Iterable):
         self.optimizers.zero_grad()
@@ -461,10 +454,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         for microbatch in range(self.gradient_accumulation_steps):
             inputs, labels = self.next_batch(data_iterator)
-            loss, aux_loss = self.batch_backward(inputs, labels)
+            loss, aux_loss, moe_entropy_per_layer = self.batch_backward(inputs, labels)
             self.metrics_processor.accumulated_losses.append(loss.detach())
             if aux_loss is not None:
                 self.metrics_processor.accumulated_aux_losses.append(loss.detach())
+            if moe_entropy_per_layer is not None:
+                self.metrics_processor.accumulated_moe_entropy_per_layer.append(
+                    moe_entropy_per_layer
+                )
+
+        # for MoE model, update the gate bias
+        for model in model_parts:
+            if hasattr(model, "update_gate_bias"):
+                model.update_gate_bias()
 
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in model_parts for p in m.parameters()],
@@ -477,12 +479,22 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.lr_schedulers.step()
 
         loss = torch.sum(torch.stack(self.metrics_processor.accumulated_losses))
+        ###### log the accumulated losses & aux_losses & moe_entropy_per_layer ######
         self.metrics_processor.accumulated_losses.clear()
         if len(self.metrics_processor.accumulated_aux_losses) > 0:
             aux_loss = torch.sum(
                 torch.stack(self.metrics_processor.accumulated_aux_losses)
             )
             self.metrics_processor.accumulated_aux_losses.clear()
+        if len(self.metrics_processor.accumulated_moe_entropy_per_layer) > 0:
+            moe_entropy_per_layer = {}
+            _list_of_dict = self.metrics_processor.accumulated_moe_entropy_per_layer
+            for layer_idx in _list_of_dict[0].keys():
+                moe_entropy_per_layer[layer_idx] = torch.sum(
+                    torch.stack([d[layer_idx] for d in _list_of_dict])
+                )
+
+            self.metrics_processor.accumulated_moe_entropy_per_layer.clear()
 
         # log metrics
         if not self.metrics_processor.should_log(self.step):
@@ -500,6 +512,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             )
             if aux_loss is not None:
                 aux_loss = dist_utils.dist_mean(aux_loss, world_mesh["dp_cp"])
+            if moe_entropy_per_layer is not None:
+                moe_entropy_per_layer = {
+                    k: dist_utils.dist_mean(v, world_mesh["dp_cp"])
+                    for k, v in moe_entropy_per_layer.items()
+                }
+
         else:
             global_avg_loss = global_max_loss = loss.item()
 
@@ -508,6 +526,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         }
         if aux_loss is not None:
             extra_log_data["loss_metrics/aux_loss"] = aux_loss
+        if moe_entropy_per_layer is not None:
+            for k, v in moe_entropy_per_layer.items():
+                extra_log_data[f"loss_metrics/moe_entropy_per_layer_{k}"] = v
 
         color = self.metrics_processor.color
         extra_print_data = f"  {color.green}gradnorm: {grad_norm:7.4f}{color.reset}"

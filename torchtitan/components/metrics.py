@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 import torch
+
 try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
@@ -314,6 +315,7 @@ class MetricsProcessor:
     data_loading_times: list[float]
     accumulated_losses: list[float]
     accumulated_aux_losses: list[float]
+    accumulated_moe_entropy_per_layer: list[dict[int, float]]
     time_last_log: float
 
     num_flop_per_token: int
@@ -342,6 +344,7 @@ class MetricsProcessor:
         self.data_loading_times = []
         self.accumulated_losses = []
         self.accumulated_aux_losses = []
+        self.accumulated_moe_entropy_per_layer = []
         self.time_last_log = time.perf_counter()
         self.device_memory_monitor.reset_peak_stats()
 
@@ -354,12 +357,12 @@ class MetricsProcessor:
         return step == 1 or step % self.job_config.metrics.log_freq == 0
 
     def log(
-            self,
-            step: int,
-            global_avg_loss: float,
-            global_max_loss: float,
-            extra_log_data: Optional[dict[str, Any]] = None,
-            extra_print_data: str = "",
+        self,
+        step: int,
+        global_avg_loss: float,
+        global_max_loss: float,
+        extra_log_data: Optional[dict[str, Any]] = None,
+        extra_print_data: str = "",
     ):
         assert self.num_flop_per_token > 0, "num_flop_per_token must be set"
 
