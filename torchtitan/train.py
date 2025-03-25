@@ -147,6 +147,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.gradient_accumulation_steps = job_config.training.global_batch_size // (
             job_config.training.batch_size * dp_degree
         )
+        logger.info(f"gradient_accumulation_steps: {self.gradient_accumulation_steps}")
         assert self.gradient_accumulation_steps > 0
 
         if job_config.training.num_mtp_tokens > 0:
