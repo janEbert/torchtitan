@@ -588,7 +588,13 @@ class Transformer(nn.Module, ModelProtocol):
 
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h
-        return output, total_moe_aux_loss, moe_entropy_per_layer
+        # return output, total_moe_aux_loss, moe_entropy_per_layer
+        return {
+            "tokens_list": [output],
+            "orig_tokens": tokens,
+            "aux_loss": total_moe_aux_loss,
+            "moe_entropy_per_layer": moe_entropy_per_layer,
+        }
 
     @classmethod
     def from_model_args(cls, model_args: MoEModelArgs) -> "Transformer":

@@ -19,7 +19,10 @@ from torch.distributed.elastic.multiprocessing.errors import record
 import torchtitan.components.ft as ft
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import cross_entropy_loss, multi_token_cross_entropy_loss
+from torchtitan.components.loss import (
+    cross_entropy_loss,
+    multi_token_cross_entropy_loss,
+)
 from torchtitan.components.metrics import (
     build_metrics_processor,
     ensure_pp_loss_visible,
@@ -127,8 +130,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # verify batch sizes
         if job_config.training.global_batch_size is None:
-            job_config.training.global_batch_size = \
+            job_config.training.global_batch_size = (
                 job_config.training.batch_size * dp_degree
+            )
         assert job_config.training.global_batch_size > 0
         assert (
             job_config.training.global_batch_size
@@ -140,14 +144,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"% ({job_config.training.batch_size} * {dp_degree}) != 0)"
         )
 
-        self.gradient_accumulation_steps = (
-            job_config.training.global_batch_size
-            // (job_config.training.batch_size * dp_degree)
+        self.gradient_accumulation_steps = job_config.training.global_batch_size // (
+            job_config.training.batch_size * dp_degree
         )
         assert self.gradient_accumulation_steps > 0
 
         if job_config.training.num_mtp_tokens > 0:
-            assert self.train_spec.loss_fn is cross_entropy_loss, "MTP requires cross-entropy loss"
+            assert (
+                self.train_spec.loss_fn is cross_entropy_loss
+            ), "MTP requires cross-entropy loss"
             self.train_spec.loss_fn = functools.partial(
                 multi_token_cross_entropy_loss,
                 job_config=job_config,
@@ -189,8 +194,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if job_config.model.vocab_size_multiple_of:
             vocab_divisor = job_config.model.vocab_size_multiple_of
             model_config.vocab_size = int(
-                math.ceil(model_config.vocab_size / vocab_divisor)
-                * vocab_divisor
+                math.ceil(model_config.vocab_size / vocab_divisor) * vocab_divisor
             )
             logger.info(
                 f"Padded vocab size from {tokenizer.n_words} to {model_config.vocab_size}."
@@ -425,15 +429,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             # Non-PP forward / backward
             with self.train_context(optional_context_parallel_ctx):
                 assert len(model_parts) == 1
-                output = model_parts[0](inputs)
-                if isinstance(output, tuple):
-                    if self.job_config.training.num_mtp_tokens:
-                        pred = output[0]
-                    else:
-                        assert len(output) == 3
-                        pred, aux_loss, moe_entropy_per_layer = output
-                else:
-                    pred = output
+                outputs = model_parts[0](inputs)
+
+                pred = outputs["tokens_list"]
+                aux_loss = outputs.get("aux_loss", None)
+                moe_entropy_per_layer = outputs.get("moe_entropy_per_layer", None)
+
                 loss = self.train_spec.loss_fn(pred, labels)
                 if aux_loss is not None:
                     loss += aux_loss / self.gradient_accumulation_steps
@@ -483,7 +484,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         loss = torch.sum(torch.stack(self.metrics_processor.accumulated_losses))
         self.metrics_processor.accumulated_losses.clear()
         if len(self.metrics_processor.accumulated_aux_losses) > 0:
-            aux_loss = torch.sum(torch.stack(self.metrics_processor.accumulated_aux_losses))
+            aux_loss = torch.sum(
+                torch.stack(self.metrics_processor.accumulated_aux_losses)
+            )
             self.metrics_processor.accumulated_aux_losses.clear()
         if len(self.metrics_processor.accumulated_moe_entropy_per_layer) > 0:
             moe_entropy_per_layer = {}
@@ -526,26 +529,29 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if aux_loss is not None:
             extra_log_data["loss_metrics/aux_loss"] = aux_loss
         if moe_entropy_per_layer is not None:
-            for (k, v) in moe_entropy_per_layer.items():
+            for k, v in moe_entropy_per_layer.items():
                 extra_log_data[f"loss_metrics/moe_entropy_per_layer_{k}"] = v
 
         color = self.metrics_processor.color
-        extra_print_data = (
-            f"  {color.green}gradnorm: {grad_norm:7.4f}{color.reset}"
-        )
+        extra_print_data = f"  {color.green}gradnorm: {grad_norm:7.4f}{color.reset}"
 
         self.metrics_processor.log(
-            self.step, global_avg_loss, global_max_loss, extra_log_data, extra_print_data,
+            self.step,
+            global_avg_loss,
+            global_max_loss,
+            extra_log_data,
+            extra_print_data,
         )
 
     @record
     def train(self):
         job_config = self.job_config
-        with maybe_enable_profiling(
-            job_config, global_step=self.step
-        ) as torch_profiler, maybe_enable_memory_snapshot(
-            job_config, global_step=self.step
-        ) as memory_profiler:
+        with (
+            maybe_enable_profiling(job_config, global_step=self.step) as torch_profiler,
+            maybe_enable_memory_snapshot(
+                job_config, global_step=self.step
+            ) as memory_profiler,
+        ):
             data_iterator = iter(self.dataloader)
             while self.step < job_config.training.steps:
                 self.step += 1

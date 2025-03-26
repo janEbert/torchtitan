@@ -84,22 +84,20 @@ class DistributedMuon(torch.optim.Optimizer):
         self.fsdp_enabled = dp_mesh is not None
         self.dp_mesh = dp_mesh  # DeviceMesh for DP communication
 
-        muon_params = [
-            p
-            for name, p in model.named_parameters()
-            if p.ndim >= 2 and "embed_tokens" not in name and "lm_head" not in name
-        ]
+        muon_params, adamw_params = [], []
+        for name, p in model.named_parameters():
+            if (
+                p.ndim >= 2
+                and "tok_embeddings.weight" not in name
+                and "output.weight" not in name
+            ):
+                muon_params.append(p)
+            else:
+                adamw_params.append(p)
 
-        adamw_params = [
-            p
-            for name, p in model.named_parameters()
-            if not (
-                p.ndim >= 2 and "embed_tokens" not in name and "lm_head" not in name
-            )
-        ]
-        print(
-            f"Muon optimizer is enabled with dp_mesh={dp_mesh} | type={type(dp_mesh)}"
-        )
+        print(f"Muon with dp_mesh={dp_mesh} | type={type(dp_mesh)}")
+        print(f"Muon params: {sum(p.numel() for p in muon_params)}")
+        print(f"AdamW params: {sum(p.numel() for p in adamw_params)}")
 
         defaults = dict(
             lr=lr,

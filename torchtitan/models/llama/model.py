@@ -360,10 +360,10 @@ class TransformerBlock(nn.Module):
 
 class MTPModule(nn.Module):
     def __init__(
-            self,
-            layer_id: int,
-            model_args: TransformerModelArgs,
-            parent_transformer: nn.Module,
+        self,
+        layer_id: int,
+        model_args: TransformerModelArgs,
+        parent_transformer: nn.Module,
     ):
         super().__init__()
         self.parent_transformer = parent_transformer
@@ -457,7 +457,9 @@ class Transformer(nn.Module, ModelProtocol):
 
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(model_args.n_layers):
-            self.layers[str(layer_id)] = self.transformer_block_cls(layer_id, model_args)
+            self.layers[str(layer_id)] = self.transformer_block_cls(
+                layer_id, model_args
+            )
 
         self.norm = build_norm(
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
@@ -526,10 +528,10 @@ class Transformer(nn.Module, ModelProtocol):
         )
 
     def forward(
-            self,
-            tokens_list: Union[list[Optional[torch.Tensor]], torch.Tensor],
-            orig_tokens: Optional[torch.Tensor] = None,
-            prev_embed: Optional[torch.Tensor] = None,
+        self,
+        tokens_list: Union[list[Optional[torch.Tensor]], torch.Tensor],
+        orig_tokens: Optional[torch.Tensor] = None,
+        prev_embed: Optional[torch.Tensor] = None,
     ):
         """
         Perform a forward pass through the Transformer model.
@@ -560,7 +562,7 @@ class Transformer(nn.Module, ModelProtocol):
 
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = (
-            self.tok_embeddings(tokens[:, :self.model_args.max_seq_len])
+            self.tok_embeddings(tokens[:, : self.model_args.max_seq_len])
             if self.tok_embeddings
             else tokens
         )
@@ -581,16 +583,23 @@ class Transformer(nn.Module, ModelProtocol):
             if self.norm and prev_embed is None:
                 prev_embed = h
 
-            for (mtp_layer_id, mtp_layer) in self.mtp_layers.items():
+            for mtp_layer_id, mtp_layer in self.mtp_layers.items():
                 mtp_layer_id = int(mtp_layer_id)
                 token_offset = mtp_layer_id + 1
                 output, prev_embed = mtp_layer(
-                    orig_tokens[:, token_offset:token_offset + self.model_args.max_seq_len],
+                    orig_tokens[
+                        :, token_offset : token_offset + self.model_args.max_seq_len
+                    ],
                     prev_embed,
                 )
                 tokens_list[mtp_layer_id + 1] = output
 
-        return tokens_list, orig_tokens, prev_embed
+        # return tokens_list, orig_tokens, prev_embed
+        return {
+            "tokens_list": tokens_list,
+            "orig_tokens": orig_tokens,
+            "prev_embed": prev_embed,
+        }
 
     @classmethod
     def from_model_args(cls, model_args: TransformerModelArgs) -> "Transformer":
