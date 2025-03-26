@@ -441,13 +441,13 @@ def build_optimizers(
                         {
                             'param_str_match': embed_str_match,
                             'lr': embed_lr,
-                            'norm_factor': 'embed_linear',
+                            'norm_factor': 'embed_sqrt',
                             'backend': 'identity'
                         },
                         { 
                             'param_str_match': unembed_str_match,
                             'lr': unembed_lr,
-                            'norm_factor': 'unembed_linear',
+                            'norm_factor': 'unembed_sqrt',
                             'backend': 'identity'
                         }
                     ]
