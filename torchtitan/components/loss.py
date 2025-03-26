@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Union
+from typing import Callable, Union
 
 import torch
 
@@ -55,6 +55,7 @@ def chunked_cross_entropy_loss(
 def multi_token_cross_entropy_loss(
         preds: Union[list[torch.Tensor], MTPInputsDict],
         labels: torch.Tensor,
+        loss_fn: Callable,
         job_config: JobConfig,
 ) -> torch.Tensor:
     """Multi-token cross-entropy loss function for Transformer model training.
@@ -64,11 +65,11 @@ def multi_token_cross_entropy_loss(
     if isinstance(preds, dict):
         preds = preds["tokens_list"]
     assert isinstance(preds, list)
-    main_loss = cross_entropy_loss(preds[0], labels[:, :job_config.training.seq_len])
+    main_loss = loss_fn(preds[0], labels[:, :job_config.training.seq_len])
 
     mtp_loss = 0
     for (label_offset, pred) in enumerate(preds[1:], 1):
-        loss = cross_entropy_loss(
+        loss = loss_fn(
             pred,
             labels[:, label_offset:label_offset + job_config.training.seq_len],
         )
