@@ -9,7 +9,7 @@
 
 from dataclasses import dataclass
 import math
-from typing import Callable, ClassVar, Optional, Tuple, Union
+from typing import Callable, ClassVar, NotRequired, Optional, Tuple, TypedDict, Union
 
 import torch
 import torch.nn.functional as F
@@ -83,6 +83,21 @@ class TransformerModelArgs(BaseModelArgs):
         flop_per_token = 6 * num_params + 12 * l * h * q * t
 
         return flop_per_token
+
+
+class TransformerInputsDict(TypedDict):
+    tokens_list: Union[list[Optional[torch.Tensor]], torch.Tensor]
+
+
+TransformerInputs = Union[torch.Tensor, TransformerInputsDict]
+
+
+class MTPInputsDict(TransformerInputsDict):
+    orig_tokens: NotRequired[Optional[torch.Tensor]]
+    prev_embed: NotRequired[Optional[torch.Tensor]]
+
+
+MTPInputs = Union[torch.Tensor, MTPInputsDict]
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
@@ -603,29 +618,38 @@ class Transformer(nn.Module, ModelProtocol):
             self.model_args.rope_theta,
         )
 
-    def forward(
-            self,
-            tokens_list: Union[list[Optional[torch.Tensor]], torch.Tensor],
-            orig_tokens: Optional[torch.Tensor] = None,
-            prev_embed: Optional[torch.Tensor] = None,
-    ):
+    def forward(self, inputs: MTPInputs) -> MTPInputsDict:
         """
         Perform a forward pass through the Transformer model.
 
         Args:
-            tokens_list (Union[list[Optional[torch.Tensor]], torch.Tensor]):
-                Input token indices.
-            orig_tokens (Optional[torch.Tensor]): Input token indices (even across
-                pipeline stages).
-            prev_embed (Optional[torch.Tensor]): Output token embeddings of
-                previous Transformer layer (after output norm, before
-                unembedding).
+            inputs (MTPInputs): Single tensor or dictionary containing the
+                following keys and values:
+                - tokens_list (Union[list[Optional[torch.Tensor]],
+                  torch.Tensor]): Input token indices.
+                - orig_tokens (Optional[torch.Tensor]): Input token indices
+                  (even across pipeline stages).
+                - prev_embed (Optional[torch.Tensor]): Output token embeddings
+                  of previous Transformer layer (after output norm, before
+                  unembedding).
 
         Returns:
-            list[Optional[torch.Tensor]]: Output logits after applying the
-                Transformer model for each output token.
+            MTPInputsDict: Dictionary containing the following keys and
+                values:
+                - tokens_list (list[Optional[torch.Tensor]]): Output logits
+                  after applying the Transformer model for each output token.
+                - orig_tokens (torch.Tensor): Input token indices
+                  (even across pipeline stages).
+                - prev_embed (Optional[torch.Tensor]): Output token embeddings
+                  of previous Transformer layer (after output norm, before
+                  unembedding).
 
         """
+        if not isinstance(inputs, dict):
+            inputs = {"tokens_list": inputs}
+        tokens_list = inputs["tokens_list"]
+        orig_tokens = inputs.get("orig_tokens", None)
+        prev_embed = inputs.get("prev_embed", None)
         if not isinstance(tokens_list, list):
             tokens = tokens_list
             tokens_list = [None] * (1 + self.model_args.num_mtp_modules)
@@ -668,7 +692,11 @@ class Transformer(nn.Module, ModelProtocol):
                 )
                 tokens_list[mtp_layer_id + 1] = output
 
-        return tokens_list, orig_tokens, prev_embed
+        return {
+            "tokens_list": tokens_list,
+            "orig_tokens": orig_tokens,
+            "prev_embed": prev_embed,
+        }
 
     @classmethod
     def from_model_args(cls, model_args: TransformerModelArgs) -> "Transformer":
