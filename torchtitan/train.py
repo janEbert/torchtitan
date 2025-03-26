@@ -500,7 +500,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         }
         extra_log_data.update(self.optimizers.get_lrs())
         if (self.step == 1 or self.step % self.job_config.metrics.log_norm_freq == 0):
-            param_norms = self.optimizers.get_parameter_norms(optimizer_name=self.job_config.optimizer.name)
+            param_norms = self.optimizers.get_parameter_norms()
             extra_log_data.update(param_norms)
 
         if aux_loss is not None:

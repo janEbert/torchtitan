@@ -17,7 +17,9 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
     StateDictOptions,
 )
-from torch.optim import Optimizer
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Replicate
+from torch.optim import Optimizer, Adam, AdamW
 
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config_manager import JobConfig
@@ -106,9 +108,9 @@ class OptimizersContainer(Optimizer, Generic[T]):
     optimizers: List[T]
     model_parts: List[nn.Module]
     norm_functions = {
-        # 'spectral_norm': lambda x: torch.linalg.norm(x.data.to(torch.float32), ord=2, dtype=torch.float32),
-        # 'l1_to_rms': lambda x: l1_to_rms_norm(x),
-        # 'rms_to_l1': lambda x: rms_to_l1_norm(x),
+        'spectral_norm': lambda x: torch.linalg.norm(x.data.to(torch.float32), ord=2, dtype=torch.float32),
+        'l1_to_rms': lambda x: l1_to_rms_norm(x),
+        'rms_to_l1': lambda x: rms_to_l1_norm(x),
     }
 
     def __init__(
@@ -166,12 +168,35 @@ class OptimizersContainer(Optimizer, Generic[T]):
         )
         list(map(func, self.model_parts, self.optimizers))
 
-    def get_parameter_norms(self, optimizer_name):
+    @staticmethod
+    def compute_grad(p, optimizer=None, **kwargs):
+        if isinstance(optimizer, Scion):
+            return optimizer._compute_grad(p, **kwargs)
+        elif isinstance(optimizer, AdamW) or isinstance(optimizer, Adam):
+            eps = kwargs['eps']
+            weight_decay = kwargs['weight_decay']
+            beta1, beta2 = kwargs['betas']
+            assert weight_decay == 0.0, "Weight decay not supported for grad computation."
+
+            param_optim_state = optimizer.state[p]
+            step = param_optim_state['step'].item()
+            bias_correction1 = 1 - beta1**step
+            bias_correction2 = 1 - beta2**step
+            denom = (param_optim_state['exp_avg_sq'].sqrt() / math.sqrt(bias_correction2)) + eps
+            step_size = 1 / bias_correction1
+            g = step_size * param_optim_state['exp_avg'].div(denom)
+
+            assert isinstance(g, DTensor), "Expected gradient to be a DTensor"
+            return g.redistribute(placements=[Replicate()] * g.device_mesh.ndim)
+        else:
+            raise NotImplementedError(f"Optimizer {optimizer.__class__.__name__} not added for grad computation.")
+        
+    def get_parameter_norms(self):
         norms = {}
         for i, _ in enumerate(self.model_parts):
             # NB: assumes correspondences between model parts and optimizers
             for group in self.optimizers[i].param_groups: 
-                if optimizer_name == 'Scion':
+                if isinstance(self.optimizers[i], Scion):
                     param_kwargs = {
                         'momentum': group['momentum'],
                         'nesterov': group['nesterov'],
@@ -180,13 +205,21 @@ class OptimizersContainer(Optimizer, Generic[T]):
                         'zeropower_backend': zeropower_backends[group['backend']],
                         'backend_steps': group['backend_steps']
                     }
+                elif isinstance(self.optimizers[i], AdamW):
+                    param_kwargs = {
+                        'eps': group['eps'],
+                        'betas': group['betas'],
+                        'weight_decay': group['weight_decay']
+                    }
                 else:
-                    raise NotImplementedError(f"Optimizer {optimizer_name} not added for norm computation.")
+                    raise NotImplementedError(f"Optimizer {self.optimizers[i].__class__.__name__} not added for norm computation.")
                 
                 for n, p in zip(group['param_names'], group['params']):
-                    g = self.optimizers[i]._compute_grad(p, **param_kwargs)
+                    g = self.compute_grad(p, self.optimizers[i], **param_kwargs)
                     if g is not None:
-                        update = -g*group['lr']
+                        p = p.to_local() if isinstance(p, DTensor) else p
+                        g = g.to_local() if isinstance(g, DTensor) else g
+                        update = -group['lr']*g
                         for norm_name, norm_func in self.norm_functions.items():
                             norms[f'model_part_{i}/{n}/param/{norm_name}'] = norm_func(p)
                             norms[f'model_part_{i}/{n}/update/{norm_name}'] = norm_func(update)
@@ -357,7 +390,11 @@ def build_optimizers(
     lr = job_config.optimizer.lr
     eps = job_config.optimizer.eps
     weight_decay = job_config.optimizer.weight_decay
-
+    embed_str_match = job_config.optimizer.embed_str_match
+    embed_lr = job_config.optimizer.embed_lr
+    unembed_str_match = job_config.optimizer.unembed_str_match
+    unembed_lr = job_config.optimizer.unembed_lr
+    
     if name in ["Adam", "AdamW"] or "Muon" in name:
         optim_implementation = job_config.optimizer.implementation
         assert optim_implementation in ["fused", "foreach", "for-loop"]
@@ -365,22 +402,31 @@ def build_optimizers(
         fused = optim_implementation == "fused"
         foreach = optim_implementation == "foreach"
 
+        assert '-multiplier-' in job_config.model.flavor, "Model flavor label must contain a multiplier"
+        width_multiplier = int(job_config.model.flavor.split('-multiplier-')[-1])
+        
         optimizer_kwargs = {
-            "lr": lr,
-            "eps": eps,
+            "lr": lr / width_multiplier,
+            "eps": eps / width_multiplier,
             "betas": (0.9, 0.95),
-            "weight_decay": 0.1,
+            "weight_decay": weight_decay * width_multiplier, # WD is coupled with LR in torch AdamW
             "fused": fused,
             "foreach": foreach,
+            'param_groups':
+                [   { 
+                        'param_str_match': embed_str_match,
+                        'lr': embed_lr,
+                    },
+                    { 
+                        'param_str_match': unembed_str_match,
+                        'lr': unembed_lr / width_multiplier,
+                    }
+                ]
         }
     elif name == "Scion":
         backend_steps = job_config.optimizer.backend_steps
         momentum = job_config.optimizer.momentum
         nesterov = job_config.optimizer.nesterov
-        embed_lr = job_config.optimizer.embed_lr
-        unembed_lr = job_config.optimizer.unembed_lr
-        embed_str_match = job_config.optimizer.embed_str_match
-        unembed_str_match = job_config.optimizer.unembed_str_match
 
         optimizer_kwargs = {
                 "lr": lr,
@@ -410,8 +456,8 @@ def build_optimizers(
         raise NotImplementedError(f"Optimizer {name} not added.")
 
     optimizer_classes = {
-        "Adam": torch.optim.Adam,
-        "AdamW": torch.optim.AdamW,
+        "Adam": Adam,
+        "AdamW": AdamW,
         "Muon": Muon,
         "DistributedMuon": DistributedMuon,
         "DistributedMuonV2": DistributedMuonV2,
