@@ -19,7 +19,10 @@ from torch.distributed.elastic.multiprocessing.errors import record
 import torchtitan.components.ft as ft
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import cross_entropy_loss, multi_token_cross_entropy_loss
+from torchtitan.components.loss import (
+    cross_entropy_loss,
+    multi_token_cross_entropy_loss,
+)
 from torchtitan.components.metrics import (
     build_metrics_processor,
     ensure_pp_loss_visible,
@@ -129,8 +132,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # verify batch sizes
         if job_config.training.global_batch_size is None:
-            job_config.training.global_batch_size = \
+            job_config.training.global_batch_size = (
                 job_config.training.batch_size * dp_degree
+            )
         assert job_config.training.global_batch_size > 0
         assert (
             job_config.training.global_batch_size
@@ -142,9 +146,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"% ({job_config.training.batch_size} * {dp_degree}) != 0)"
         )
 
-        self.gradient_accumulation_steps = (
-            job_config.training.global_batch_size
-            // (job_config.training.batch_size * dp_degree)
+        self.gradient_accumulation_steps = job_config.training.global_batch_size // (
+            job_config.training.batch_size * dp_degree
         )
         assert self.gradient_accumulation_steps > 0
 
@@ -157,8 +160,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if job_config.training.num_mtp_tokens > 0:
             pre_mtp_loss_fn = self.train_spec.loss_fn
-            assert pre_mtp_loss_fn in [cross_entropy_loss, moe_loss], \
-                "MTP requires cross-entropy loss"
+            assert pre_mtp_loss_fn in [
+                cross_entropy_loss,
+                moe_loss,
+            ], "MTP requires cross-entropy loss"
             self.train_spec.loss_fn = functools.partial(
                 multi_token_cross_entropy_loss,
                 loss_fn=pre_mtp_loss_fn,
@@ -201,8 +206,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if job_config.model.vocab_size_multiple_of:
             vocab_divisor = job_config.model.vocab_size_multiple_of
             model_config.vocab_size = int(
-                math.ceil(model_config.vocab_size / vocab_divisor)
-                * vocab_divisor
+                math.ceil(model_config.vocab_size / vocab_divisor) * vocab_divisor
             )
             logger.info(
                 f"Padded vocab size from {tokenizer.n_words} to {model_config.vocab_size}."
@@ -314,11 +318,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"({device_mem_stats.max_reserved_pct:.2f}%)"
         )
 
-        muon_kwargs = {"rank": dp_rank, "world_size": dp_degree}
+        muon_kwargs = {
+            "rank": dp_rank,
+            "world_size": dp_degree,
+            "world_mesh": world_mesh,
+        }
 
-        if parallel_dims.dp_shard_enabled:
-            muon_kwargs["dp_mesh"] = world_mesh["dp_shard_cp"]
-
+        # build optimizer after applying parallelisms to the model
+        self.optimizers = self.train_spec.build_optimizers_fn(
+            self.model_parts, job_config, ft_manager, muon_kwargs
+        )
+        
         # build optimizer after applying parallelisms to the model
         self.optimizers = self.train_spec.build_optimizers_fn(
             self.model_parts, job_config, ft_manager, muon_kwargs
@@ -489,7 +499,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         loss = torch.sum(torch.stack(self.metrics_processor.accumulated_losses))
         self.metrics_processor.accumulated_losses.clear()
         if len(self.metrics_processor.accumulated_aux_losses) > 0:
-            aux_loss = torch.sum(torch.stack(self.metrics_processor.accumulated_aux_losses))
+            aux_loss = torch.sum(
+                torch.stack(self.metrics_processor.accumulated_aux_losses)
+            )
             self.metrics_processor.accumulated_aux_losses.clear()
         if len(self.metrics_processor.accumulated_moe_entropy_per_layer) > 0:
             moe_entropy_per_layer = {}
@@ -532,26 +544,29 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if aux_loss is not None:
             extra_log_data["loss_metrics/aux_loss"] = aux_loss
         if moe_entropy_per_layer is not None:
-            for (k, v) in moe_entropy_per_layer.items():
+            for k, v in moe_entropy_per_layer.items():
                 extra_log_data[f"loss_metrics/moe_entropy_per_layer_{k}"] = v
 
         color = self.metrics_processor.color
-        extra_print_data = (
-            f"  {color.green}gradnorm: {grad_norm:7.4f}{color.reset}"
-        )
+        extra_print_data = f"  {color.green}gradnorm: {grad_norm:7.4f}{color.reset}"
 
         self.metrics_processor.log(
-            self.step, global_avg_loss, global_max_loss, extra_log_data, extra_print_data,
+            self.step,
+            global_avg_loss,
+            global_max_loss,
+            extra_log_data,
+            extra_print_data,
         )
 
     @record
     def train(self):
         job_config = self.job_config
-        with maybe_enable_profiling(
-            job_config, global_step=self.step
-        ) as torch_profiler, maybe_enable_memory_snapshot(
-            job_config, global_step=self.step
-        ) as memory_profiler:
+        with (
+            maybe_enable_profiling(job_config, global_step=self.step) as torch_profiler,
+            maybe_enable_memory_snapshot(
+                job_config, global_step=self.step
+            ) as memory_profiler,
+        ):
             data_iterator = iter(self.dataloader)
             while self.step < job_config.training.steps:
                 self.step += 1
