@@ -217,7 +217,9 @@ class OptimizersContainer(Optimizer, Generic[T]):
                 for n, p in zip(group['param_names'], group['params']):
                     g = self.compute_grad(p, self.optimizers[i], **param_kwargs)
                     if g is not None:
-                        p = p.to_local() if isinstance(p, DTensor) else p
+                        p = p.redistribute(
+                                placements=[Replicate()] * p.device_mesh.ndim
+                            ).to_local() if isinstance(p, DTensor) else p
                         g = g.to_local() if isinstance(g, DTensor) else g
                         update = -group['lr']*g
                         if 'tok_embeddings' in n:
