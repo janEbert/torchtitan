@@ -1,88 +1,62 @@
-import math
-
 import torch
-import torch.distributed as dist
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.distributed.tensor.placement_types import Replicate
+from .muon_utils import zeropower_via_newtonschulz5
+from .muon_utils import update_adamw as real_adamw_update
+from torchtitan.tools.logging import logger
 
 
-@torch.compile
-def zeropower_via_newtonschulz5(G, steps):
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
-    """
-    assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
-    if G.size(0) > G.size(1):
-        X = X.T
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm() + 1e-7)
-    # Perform the NS iterations
-    for _ in range(steps):
-        A = X @ X.T
-        B = (
-            b * A + c * A @ A
-        )  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
+"""
+Before clean up     : 85.852 ms
+After clean  up     : 79.852 ms
+Fused AdamW         : 67.833 ms
+Fused AdamW-Async:  : 63.955 ms
 
-    if G.size(0) > G.size(1):
-        X = X.T
-    return X
+DDP                 : 42.206 ms
+DDP  + Dist-muon     : 5.53ms
+FSDP + Dist-muon    : 10.130 ms
+
+"""
+
+# 70.226 ms
 
 
 class Muon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
-
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
-
-    Some warnings:
-    - We believe this optimizer is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
-
-    Arguments:
-        muon_params: The parameters to be optimized by Muon.
-        lr: The learning rate. The updates will have spectral norm of `lr`. (0.02 is a good default)
-        momentum: The momentum used by the internal SGD. (0.95 is a good default)
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        ns_steps: The number of Newton-Schulz iterations to run. (6 is probably always enough)
-        adamw_params: The parameters to be optimized by AdamW. Any parameters in `muon_params` which are
-        {0, 1}-D or are detected as being the embed or lm_head will be optimized by AdamW as well.
-        adamw_lr: The learning rate for the internal AdamW.
-        adamw_betas: The betas for the internal AdamW.
-        adamw_eps: The epsilon for the internal AdamW.
-        adamw_wd: The weight decay for the internal AdamW.
-    """
-
     def __init__(
         self,
         full_params,
         model,
         lr=1e-3,
         wd=0.1,
-        muon_params=None,
         momentum=0.95,
         nesterov=True,
         ns_steps=5,
-        adamw_params=None,
+        world_mesh=None,
+        communication_dtype="bf16",
+        # == AdamW parameters ==
+        async_adamw=True,
+        adamw_lr=None,
+        adamw_weight_decay=0.1,
         adamw_betas=(0.95, 0.95),
         adamw_eps=1e-8,
-        dp_mesh=None,
+        adamw_amsgrad=False,
+        adamw_foreach=False,
+        adamw_capturable=False,
+        adamw_differentiable=False,
+        adamw_fused=True,  # lets use fused AdamW by default
+        adamw_maximize=False,
         **kwargs,
     ):
+        self.fsdp_enabled = "dp_shard" in world_mesh.mesh_dim_names
+        self.world_mesh = world_mesh
 
-        self.fsdp_enabled = dp_mesh is not None
-        self.dp_mesh = dp_mesh  # DeviceMesh for DP communication
+        if communication_dtype == "bf16":
+            self.communication_dtype = torch.bfloat16
+        elif communication_dtype == "fp16":
+            self.communication_dtype = torch.float16
+        elif communication_dtype == "fp32":
+            self.communication_dtype = torch.float32
+
         muon_params, adamw_params = [], []
 
         for name, p in model.named_parameters():
@@ -93,12 +67,11 @@ class Muon(torch.optim.Optimizer):
             ):
                 muon_params.append(p)
             else:
-                print(f"AdamW param: {name} | shape: {p.shape}")
                 adamw_params.append(p)
 
-        print(f"Muon with dp_mesh={dp_mesh} | type={type(dp_mesh)}")
-        print(f"Muon params: {sum(p.numel() for p in muon_params)}")
-        print(f"AdamW params: {sum(p.numel() for p in adamw_params)}")
+        logger.info(f"Muon params: {sum(p.numel() for p in muon_params)}")
+        logger.info(f"AdamW params: {sum(p.numel() for p in adamw_params)}")
+        self.async_adamw = async_adamw
 
         defaults = dict(
             lr=lr,
@@ -106,12 +79,21 @@ class Muon(torch.optim.Optimizer):
             momentum=momentum,
             nesterov=nesterov,
             ns_steps=ns_steps,
+            # == AdamW parameters ==
+            adamw_lr=adamw_lr if adamw_lr is not None else lr,
             adamw_betas=adamw_betas,
             adamw_eps=adamw_eps,
+            adamw_weight_decay=adamw_weight_decay,
+            adamw_amsgrad=adamw_amsgrad,
+            adamw_maximize=adamw_maximize,
+            adamw_foreach=adamw_foreach,
+            adamw_capturable=adamw_capturable,
+            adamw_differentiable=adamw_differentiable,
+            adamw_fused=adamw_fused,
         )
 
         params = list(muon_params)
-        adamw_params = list(adamw_params) if adamw_params is not None else []
+        adamw_params = list(adamw_params)
         params.extend(adamw_params)
         super().__init__(params, defaults)
         # Sort parameters into those for which we will use Muon, and those for which we will not
@@ -123,178 +105,83 @@ class Muon(torch.optim.Optimizer):
             # Do not use Muon for parameters in adamw_params
             self.state[p]["use_muon"] = False
 
-    def adjust_lr_for_muon(self, lr, param_shape):
-        A, B = param_shape[:2]
-        # We adjust the learning rate and weight decay based on the size of the parameter matrix
-        # as describted in the paper
-        adjusted_ratio = 0.2 * math.sqrt(max(A, B))
-        adjusted_lr = lr * adjusted_ratio
-        return adjusted_lr
+    def update_muon_momentum_and_get_gradient(self, p, nestroev=False, momentum=0):
+        g = p.grad
+        if g.ndim > 2:
+            g = g.view(g.size(0), -1)
+        state = self.state[p]
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros_like(g)
+        buf = state["momentum_buffer"]
+        buf.mul_(momentum).add_(g)
+        if nestroev:
+            g = p.grad.add(buf, alpha=momentum)
+        else:
+            g = buf
+        return g
 
-    def gather_full_grad(self, g):
-        """Gathers the full gradient across all distributed processes using DTensor."""
-        if not self.fsdp_enabled:
-            return g  # No sharding, return the original gradient
-
-        if not isinstance(g, DTensor):
-            raise RuntimeError(
-                "Expected gradient to be a DTensor, but got a regular tensor."
-            )
-
-        # Ensure g is in the correct mesh
-        if g.device_mesh != self.dp_mesh:
-            raise RuntimeError(
-                f"Gradient tensor's DeviceMesh ({g.device_mesh.mesh_dim_names}) "
-                f"does not match optimizer's DeviceMesh ({self.dp_mesh.mesh_dim_names})."
-            )
-
-        # Convert local gradients into a DTensor replicated across data parallel ranks
-        replicated_grad = DTensor.from_local(
-            g.to_local(), self.dp_mesh, placements=[Replicate()]
-        )
-
-        return replicated_grad
-
-    def get_shard(self, u, rank=None, world_size=None):
-        if not self.fsdp_enabled:
-            return u
-        """Extracts the correct shard for this rank, ensuring compatibility with p.data."""
-        if rank is None:
-            rank = dist.get_rank()
-        if world_size is None:
-            world_size = dist.get_world_size()
-
-        num_rows, num_cols = u.shape  # Get full shape of u
-        shard_size = num_rows // world_size  # Number of rows per rank
-
-        # start_idx = rank * shard_size
-        # end_idx = (rank + 1) * shard_size if rank != world_size - 1 else num_rows
-        # Extract the correct shard
-        # local_shard = u.to_local()[start_idx:end_idx, :]
-
-        local_shards = torch.chunk(u.to_local(), world_size, dim=0)
-        local_shard = (
-            local_shards[rank]
-            if rank < len(local_shards)
-            else torch.zeros_like(local_shards[0])
-        )
-
-        # Ensure the shard shape matches p.data
-        if local_shard.shape[0] != num_rows:
-            pad_size = num_rows - local_shard.shape[0]
-            pad = torch.zeros(
-                (pad_size, num_cols), device=local_shard.device, dtype=local_shard.dtype
-            )
-            local_shard = torch.cat([local_shard, pad], dim=0)
-
-        # Convert back to DTensor with correct Shard placement
-        shard = DTensor.from_local(local_shard, u.device_mesh, placements=[Shard(0)])
-
-        return shard
+    def update_adamw(self):
+        if self.async_adamw:
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())  # <- CRITICAL
+            with torch.cuda.stream(stream):
+                real_adamw_update(self)
+        else:
+            real_adamw_update(self)
 
     def step(self, closure=None):
-        """Perform a single optimization step.
-
-        Args:
-            closure (Callable, optional): A closure that reevaluates the model
-                and returns the loss.
-        """
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
 
+        self.update_adamw()
+        ############################################################
+        #       Muon update for parameters with use_muon=True       #
+        ############################################################
+
         for group in self.param_groups:
-
-            ############################
-            #           Muon           #
-            ############################
-
-            params = [p for p in group["params"] if self.state[p]["use_muon"]]
-            # import pdb; pdb.set_trace()
             lr = group["lr"]
             wd = group["wd"]
             momentum = group["momentum"]
+            nestroev = group["nesterov"]
+            ns_steps = group["ns_steps"]
+
+            params = [
+                p
+                for p in group["params"]
+                if self.state[p]["use_muon"] and p.grad is not None
+            ]
+            params.sort(key=lambda x: x.numel(), reverse=True)
 
             # generate weight updates in distributed fashion
             for p in params:
-                # sanity check
-                g = p.grad
-                if g is None:
-                    continue
-                if g.ndim > 2:
-                    g = g.view(g.size(0), -1)
-                assert g is not None
-
+                g = self.update_muon_momentum_and_get_gradient(p, nestroev, momentum)
                 ############################
-                # DISTRIBUTED MUON UPDATE #
                 # Step 1: Gather full gradient across ranks
-
-                g = self.gather_full_grad(g)
-
-                # calc update
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-                if group["nesterov"]:
-                    g = g.add(buf, alpha=momentum)
+                if self.fsdp_enabled:
+                    full_g = g.redistribute(
+                        placements=[Replicate()] * g.device_mesh.ndim
+                    ).to_local()
                 else:
-                    g = buf
-                u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                    full_g = g
+                ############################
+                # Step 2: Run the Newton-Schulz iteration
+                u = zeropower_via_newtonschulz5(full_g, steps=ns_steps)
+
+                # ############################
+                # # Step 3: Extract the correct shard for this rank
+                if self.fsdp_enabled:
+                    u = DTensor.from_local(
+                        u,
+                        device_mesh=g.device_mesh,
+                        placements=[Replicate()],
+                    ).redistribute(placements=g.placements)
 
                 ############################
-                # DISTRIBUTED MUON UPDATE #
-                # Step 2: Extract the correct shard for this rank
-                u = self.get_shard(u)
-
-                # scale update
-                adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
-
-                # apply weight decay
-                p.data.mul_(1 - lr * wd)
-
-                if u.shape != p.data.shape:
-                    raise RuntimeError(
-                        f"Shape mismatch: u.shape={u.shape}, p.data.shape={p.data.shape}"
-                    )
-
-                # apply update
-                p.data.add_(u, alpha=-adjusted_lr)
-
-            ############################
-            #       AdamW backup       #
-            ############################
-
-            params = [p for p in group["params"] if not self.state[p]["use_muon"]]
-            lr = group["lr"]
-            beta1, beta2 = group["adamw_betas"]
-            eps = group["adamw_eps"]
-            weight_decay = group["wd"]
-
-            for p in params:
-                g = p.grad
-                if g is None:
-                    continue
-                state = self.state[p]
-                if "step" not in state:
-                    state["step"] = 0
-                    state["moment1"] = torch.zeros_like(g)
-                    state["moment2"] = torch.zeros_like(g)
-                state["step"] += 1
-                step = state["step"]
-                buf1 = state["moment1"]
-                buf2 = state["moment2"]
-                buf1.lerp_(g, 1 - beta1)
-                buf2.lerp_(g.square(), 1 - beta2)
-
-                g = buf1 / (eps + buf2.sqrt())
-
-                bias_correction1 = 1 - beta1**step
-                bias_correction2 = 1 - beta2**step
-                scale = bias_correction1 / bias_correction2**0.5
-                p.data.mul_(1 - lr * weight_decay)
-                p.data.add_(g, alpha=-lr / scale)
+                # Step 4: update the parameter
+                with torch.no_grad():
+                    # apply weight decay and update parameters
+                    p.data.mul_(1 - lr * wd).add_(u, alpha=-lr)
 
         return loss
