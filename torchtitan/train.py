@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import math
 import functools
 import importlib
 import os
@@ -201,8 +200,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         with torch.device("meta"):
             model = model_cls.from_model_args(model_args)
-
-        logger.info(f"model: {model}")
 
         logger.info(f"model: {model}")
 

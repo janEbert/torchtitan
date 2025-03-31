@@ -6,7 +6,7 @@
 
 import functools
 import math
-from typing import Any, Callable, Dict, Generic, List, TypeVar, Union
+from typing import Any, Dict, Generic, List, TypeVar
 import re
 from collections import OrderedDict
 
@@ -23,8 +23,6 @@ from torch.optim import Optimizer, Adam, AdamW
 
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config_manager import JobConfig
-
-from optimizers import DistributedMuon, DistributedMuonV2, Muon
 
 from optimizers import DistributedMuon, DistributedMuonV2, Muon, Scion
 from torchtitan.optimizers.scion import zeropower_backends
