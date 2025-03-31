@@ -603,6 +603,9 @@ class Transformer(nn.Module, ModelProtocol):
                 a=-cutoff_factor * final_out_std,
                 b=cutoff_factor * final_out_std,
             )
+        for layer in self.mtp_layers.values():
+            if layer is not None:
+                layer.init_weights()
 
     def _precompute_freqs_cis(self) -> torch.Tensor:
         return precompute_freqs_cis(
