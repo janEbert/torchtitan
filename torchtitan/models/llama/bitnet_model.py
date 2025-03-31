@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Callable
 
 import torch
 import torch.nn.functional as F
@@ -40,9 +40,9 @@ class BitNetAttention(Attention):
         super().__init__(model_args)
         self.wo_norm = build_norm(model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps)
 
-    def init_weights(self, init_std: float, residual_div: float):
+    def init_weights(self, init_fn: Callable, init_std: float, residual_div: float):
         self.wo_norm.reset_parameters()
-        super().init_weights(init_std, residual_div)
+        super().init_weights(init_fn, init_std, residual_div)
 
     def forward(
         self,
@@ -134,9 +134,9 @@ class BitNetFeedForward(FeedForward):
     def forward(self, x):
         return self.w2(self.w2_norm(F.silu(self.w1(x)) * self.w3(x)))
 
-    def init_weights(self, init_std: float, residual_div: float):
+    def init_weights(self, init_fn: Callable, init_std: float, residual_div: float):
         self.w2_norm.reset_parameters()
-        super().init_weights(init_std, residual_div)
+        super().init_weights(init_fn, init_std, residual_div)
 
 
 class BitNetTransformerBlock(TransformerBlock):

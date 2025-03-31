@@ -190,6 +190,27 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
 
+def orthogonal_(parameters, gain=1.0, generator=None):
+    from torch.distributed.tensor import DTensor, Replicate
+
+    if isinstance(parameters, nn.Parameter):
+        tensor = parameters.data
+    else:
+        tensor = parameters
+
+    if not isinstance(tensor, DTensor):
+        return nn.init.orthogonal_(tensor, gain=gain, generator=generator)
+
+    zeros = torch.zeros(tensor.shape, dtype=tensor.dtype, device=tensor.device)
+    nn.init.orthogonal_(zeros, gain=gain, generator=generator)
+
+    zeros = DTensor.from_local(
+        zeros,
+        placements=[Replicate()] * tensor.device_mesh.ndim,
+        device_mesh=tensor.device_mesh,
+    ).redistribute(placements=tensor.placements)
+
+    tensor.data = zeros
 
 class Attention(nn.Module):
     """
@@ -264,9 +285,16 @@ class Attention(nn.Module):
                 eps=model_args.norm_eps,
             )
 
-    def init_weights(self, init_std: float, residual_div: float):
+    def init_weights(self, init_fn: Callable, init_std: float, residual_div: float):
         for linear in (self.wq, self.wk, self.wv, self.wo):
-            nn.init.normal_(linear.weight, mean=0.0, std=init_std)
+            if init_fn is not None:
+                init_fn(linear.weight)
+            elif init_std > 0:
+                nn.init.normal_(linear.weight, mean=0.0, std=init_std)
+            else:
+                raise ValueError(
+                    f"Invalid initialization function or standard deviation: {init_fn}, {init_std}"
+                )
         with torch.no_grad():
             self.wo.weight.div_(residual_div)
 
@@ -380,9 +408,16 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
-    def init_weights(self, init_std: float, residual_div: float):
+    def init_weights(self, init_fn: Callable, init_std: float, residual_div: float):
         for linear in (self.w1, self.w2, self.w3):
-            nn.init.normal_(linear.weight, mean=0.0, std=init_std)
+            if init_fn is not None:
+                init_fn(linear.weight)
+            elif init_std > 0:
+                nn.init.normal_(linear.weight, mean=0.0, std=init_std)
+            else:
+                raise ValueError(
+                    f"Invalid initialization function or standard deviation: {init_fn}, {init_std}"
+                )
         with torch.no_grad():
             self.w2.weight.div_(residual_div)
 
@@ -430,7 +465,13 @@ class TransformerBlock(nn.Module):
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
         )
 
-        self.init_std = model_args.init_std / model_args.dim ** 0.5
+        self.init_std = None
+        self.init_fn = None
+        if model_args.init_std > 0:
+            self.init_std = model_args.init_std / model_args.dim ** 0.5
+        else:
+            self.init_fn = orthogonal_
+
         if model_args.depth_init:
             self.residual_div = (2 * (self.layer_id + 1)) ** 0.5
         else:
@@ -459,8 +500,8 @@ class TransformerBlock(nn.Module):
     def init_weights(self):
         for norm in (self.attention_norm, self.ffn_norm):
             norm.reset_parameters()
-        self.attention.init_weights(init_std=self.init_std, residual_div=self.residual_div)
-        self.feed_forward.init_weights(init_std=self.init_std, residual_div=self.residual_div)
+        self.attention.init_weights(init_fn=self.init_fn, init_std=self.init_std, residual_div=self.residual_div)
+        self.feed_forward.init_weights(init_fn=self.init_fn, init_std=self.init_std, residual_div=self.residual_div)
 
 
 class MTPModule(nn.Module):
@@ -603,21 +644,49 @@ class Transformer(nn.Module, ModelProtocol):
         with torch.device(buffer_device):
             self.freqs_cis = self._precompute_freqs_cis()
         if self.tok_embeddings is not None:
-            nn.init.normal_(
-                self.tok_embeddings.weight,
-                mean=0.0,
-                std=self.model_args.vocab_size ** -0.5)
+            if self.model_args.init_std > 0:
+                nn.init.normal_(
+                    self.tok_embeddings.weight,
+                    mean=0.0,
+                    std=self.model_args.init_std * self.model_args.vocab_size ** -0.5)
+            else:
+                nn.init.normal_(
+                    self.tok_embeddings.weight,
+                    mean=0.0,
+                    std=1.0,
+                )
+                # catch cases when axis=1 is sharded
+                assert self.tok_embeddings.weight.size(1) == self.model_args.dim, (
+                    f"Input embedding last dim does not match model dim. Got shape: {self.tok_embeddings.weight.shape}"
+                )
+                with torch.no_grad():
+                    torch.rsqrt_(self.tok_embeddings.weight.pow(2).sum(axis=1, keepdim=True) + 1e-12)
         for layer in self.layers.values():
             if layer is not None:
                 layer.init_weights()
         if self.norm is not None:
             self.norm.reset_parameters()
         if self.output is not None:
-            nn.init.normal_(
-                self.output.weight,
-                mean=0.0,
-                std=self.model_args.dim ** -1.0,
-            )
+            if self.model_args.init_std > 0:
+                nn.init.normal_(
+                    self.output.weight,
+                    mean=0.0,
+                    std=self.model_args.init_std * self.model_args.dim ** -1.0,
+                )
+            elif self.model_args.init_std == 0:
+                torch.nn.init.zeros_(self.output.weight)
+            else:
+                nn.init.normal_(
+                    self.output.weight,
+                    mean=0.0,
+                    std=1.0,
+                )
+                # catch cases when axis=1 is sharded
+                assert self.output.weight.size(1) == self.model_args.dim, (
+                    f"Output last dim does not match model dim. Got shape: {self.output.weight.shape}"
+                )
+                with torch.no_grad():
+                    torch.rsqrt_(self.output.weight.pow(2).sum(axis=1, keepdim=True) + 1e-12)
         if self.model_args.num_mtp_modules > 0:
             for layer in self.mtp_layers.values():
                 if layer is not None:
