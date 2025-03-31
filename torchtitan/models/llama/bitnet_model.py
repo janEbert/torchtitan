@@ -60,6 +60,7 @@ class BitNetAttention(Attention):
             torch.Tensor: Output tensor after attention.
 
         """
+
         bs, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
@@ -86,7 +87,12 @@ class BitNetAttention(Attention):
         xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
 
         # we use casual mask for training
-        output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
+        if self.use_flex_attn:
+            # assert False, (type(xq), type(xk), type(xv))
+            self._init_flex_attn(seqlen=seqlen)
+            output = self.flex_attn(xq, xk, xv, block_mask=self.block_mask)
+        else:
+            output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
         output = output.transpose(
             1, 2
         ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
