@@ -3,344 +3,215 @@ import math
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Replicate, Shard
+from .muon_utils import zeropower_via_newtonschulz5
+from .muon import Muon
+from functools import partial
 
 
-@torch.compile
-def zeropower_via_newtonschulz5(G, steps):
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
-    """
-    assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
-    if G.size(0) > G.size(1):
-        X = X.T
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm() + 1e-7)
-    # Perform the NS iterations
-    for _ in range(steps):
-        A = X @ X.T
-        B = (
-            b * A + c * A @ A
-        )  # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
-
-    if G.size(0) > G.size(1):
-        X = X.T
-    return X
-
-
-class DistributedMuon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
-
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
-
-    Some warnings:
-    - We believe this optimizer is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
-
-    Arguments:
-        muon_params: The parameters to be optimized by Muon.
-        lr: The learning rate. The updates will have spectral norm of `lr`. (0.02 is a good default)
-        momentum: The momentum used by the internal SGD. (0.95 is a good default)
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        ns_steps: The number of Newton-Schulz iterations to run. (6 is probably always enough)
-        adamw_params: The parameters to be optimized by AdamW. Any parameters in `muon_params` which are
-        {0, 1}-D or are detected as being the embed or lm_head will be optimized by AdamW as well.
-        adamw_lr: The learning rate for the internal AdamW.
-        adamw_betas: The betas for the internal AdamW.
-        adamw_eps: The epsilon for the internal AdamW.
-        adamw_wd: The weight decay for the internal AdamW.
-    """
-
+class DistributedMuon(Muon):
     def __init__(
         self,
         full_params,
         model,
-        lr=1e-3,
-        wd=0.1,
-        muon_params=None,
-        momentum=0.95,
-        nesterov=True,
-        ns_steps=5,
-        adamw_params=None,
-        adamw_betas=(0.95, 0.95),
-        adamw_eps=1e-8,
-        dp_mesh=None,
         **kwargs,
     ):
+        super().__init__(full_params, model, **kwargs)
 
-        self.fsdp_enabled = dp_mesh is not None
-        self.dp_mesh = dp_mesh  # DeviceMesh for DP communication
+    def update_bucket_params(self, params, updates, start_idx, end_idx, lr, wd):
+        for idx_in_bucket in range(start_idx, end_idx):
+            shift = idx_in_bucket - start_idx
+            p = params[idx_in_bucket]
+            u = updates[shift]
 
-        muon_params, adamw_params = [], []
-        for name, p in model.named_parameters():
-            if (
-                p.ndim >= 2
-                and "tok_embeddings.weight" not in name
-                and "output.weight" not in name
-            ):
-                muon_params.append(p)
-            else:
-                adamw_params.append(p)
+            with torch.no_grad():
+                if isinstance(p, DTensor) and not isinstance(u, DTensor):
+                    p.data.to_local().mul_(1 - lr * wd).add_(u, alpha=-lr)
+                else:
+                    p.data.mul_(1 - lr * wd).add_(u, alpha=-lr)
 
-        print(f"Muon with dp_mesh={dp_mesh} | type={type(dp_mesh)}")
-        print(f"Muon params: {sum(p.numel() for p in muon_params)}")
-        print(f"AdamW params: {sum(p.numel() for p in adamw_params)}")
+    def calculate_shard_shape(self, shape, source_rank, world_size):
+        full_dim0 = shape[0]
+        base = (full_dim0 + world_size - 1) // world_size  # ceil division
+        remainder = full_dim0 - base * (world_size - 1)
+        if source_rank < world_size - 1:
+            dim0 = base
+        else:
+            dim0 = remainder
+        return (dim0, *shape[1:])
 
-        defaults = dict(
-            lr=lr,
-            wd=wd,
-            momentum=momentum,
-            nesterov=nesterov,
-            ns_steps=ns_steps,
-            adamw_betas=adamw_betas,
-            adamw_eps=adamw_eps,
-        )
-
-        params = list(muon_params)
-        adamw_params = list(adamw_params) if adamw_params is not None else []
-        params.extend(adamw_params)
-        super().__init__(params, defaults)
-        # Sort parameters into those for which we will use Muon, and those for which we will not
-        for p in muon_params:
-            # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
-            assert p.ndim == 2, p.ndim
-            self.state[p]["use_muon"] = True
-        for p in adamw_params:
-            # Do not use Muon for parameters in adamw_params
-            self.state[p]["use_muon"] = False
-
-    def adjust_lr_for_muon(self, lr, param_shape):
-        A, B = param_shape[:2]
-        # We adjust the learning rate and weight decay based on the size of the parameter matrix
-        # as describted in the paper
-        adjusted_ratio = 0.2 * math.sqrt(max(A, B))
-        adjusted_lr = lr * adjusted_ratio
-        return adjusted_lr
-
-    def gather_full_grad(self, g):
-        """Gathers the full gradient across all distributed processes using DTensor."""
-        if not self.fsdp_enabled:
-            return g  # No sharding, return the original gradient
-
-        if not isinstance(g, DTensor):
-            raise RuntimeError(
-                "Expected gradient to be a DTensor, but got a regular tensor."
-            )
-
-        # Ensure g is in the correct mesh
-        if g.device_mesh != self.dp_mesh:
-            raise RuntimeError(
-                f"Gradient tensor's DeviceMesh ({g.device_mesh.mesh_dim_names}) "
-                f"does not match optimizer's DeviceMesh ({self.dp_mesh.mesh_dim_names})."
-            )
-
-        # Convert local gradients into a DTensor replicated across data parallel ranks
-        replicated_grad = DTensor.from_local(
-            g.to_local(), self.dp_mesh, placements=[Replicate()]
-        )
-
-        return replicated_grad
-
-    def update_adamw(
+    def step_ddp(
         self,
+        params,
+        lr,
+        wd,
+        momentum,
+        nesterov,
+        ns_steps,
+        bucket_size,
+        total_buckets,
+        world_size,
+        rank,
     ):
-        ############################
-        #       AdamW backup       #
-        ############################
-        for group in self.param_groups:
-            # Get all parameters that don't use muon and have gradients
-            params = [
-                p
-                for p in group["params"]
-                if not self.state[p]["use_muon"] and p.grad is not None
+        device = params[0].device
+        cast_dtype = self.communication_dtype
+        zero_tensor = partial(torch.zeros, dtype=cast_dtype, device=device)
+        for bucket_idx in range(total_buckets):
+            start_idx = bucket_idx * bucket_size
+            end_idx = min(start_idx + bucket_size, len(params))
+            current_rank_idx = start_idx + rank
+            if current_rank_idx < len(params):
+                p = params[current_rank_idx]
+                # Step 1: Get the gradient
+                g = self.update_muon_momentum_and_get_gradient(p, nesterov, momentum)
+
+            else:
+                """
+                To avoid idle stream, we can randomly generate on last ranks
+                """
+                g = zero_tensor(params[end_idx - 1].shape)
+
+            u = zeropower_via_newtonschulz5(g, steps=ns_steps)
+
+            # Step 3: FOR DDP, we do all-gather
+            gather_lists = [None] * world_size
+
+            for i in range(world_size):
+                param_idx = start_idx + i
+                if i == rank or param_idx >= len(params):
+                    gather_lists[i] = u.to(dtype=cast_dtype)
+                elif param_idx < len(params):
+                    p = params[start_idx + i]
+                    gather_lists[i] = zero_tensor(p.shape)
+
+            dist.all_gather(gather_lists, u)
+            # Step 4: Update the parameters
+            self.update_bucket_params(params, gather_lists, start_idx, end_idx, lr, wd)
+
+    def step_fsdp(
+        self,
+        params,
+        lr,
+        wd,
+        momentum,
+        nesterov,
+        ns_steps,
+        bucket_size,
+        total_buckets,
+        world_size,
+        rank,
+    ):
+        device = params[0].device
+        cast_dtype = self.communication_dtype
+        zero_tensor = partial(torch.zeros, dtype=cast_dtype, device=device)
+
+        # Process each bucket
+        for bucket_idx in range(total_buckets):
+            start_idx = bucket_idx * bucket_size
+            end_idx = min(start_idx + bucket_size, len(params))
+
+            # Step 1: Prepare data for first all_to_all
+            send_list = []
+            send_shapes = []
+            target_shape = None
+
+            for rank_idx in range(world_size):
+                current_rank_idx = start_idx + rank_idx
+
+                if current_rank_idx < len(params):
+                    p = params[current_rank_idx]
+                    g = (
+                        self.update_muon_momentum_and_get_gradient(
+                            p, nesterov, momentum
+                        )
+                        .to_local()
+                        .to(dtype=cast_dtype)
+                    )
+
+                    # Save the shape info for this parameter
+                    if rank == rank_idx:
+                        target_shape = p.shape
+                else:
+                    # Use a dummy shape for parameters beyond our range
+                    p = params[end_idx - 1]
+                    g = zero_tensor(p.to_local().shape)
+
+                send_list.append(g)
+                send_shapes.append(g.shape)
+
+            # Make sure target_shape is initialized
+            if target_shape is None and end_idx > 0:
+                target_shape = params[start_idx].shape
+
+            recv_shapes = [
+                self.calculate_shard_shape(target_shape, rank_idx, world_size)
+                for rank_idx in range(world_size)
             ]
+            recv_list = [zero_tensor(shape) for shape in recv_shapes]
 
-            if not params:
-                continue
+            # Step 3: First all_to_all - using ASYNC version
+            dist.all_to_all(recv_list, send_list)
 
-            lr = group["lr"]
-            beta1, beta2 = group["adamw_betas"]
-            eps = group["adamw_eps"]
-            weight_decay = group["wd"]
+            # Step 5: Concatenate received gradients along dimension 0 and perform NS5
+            # All tensors in recv_list should have the same dimensions except for dim 0
 
-            # Process parameters one by one - simple, reliable approach
-            for p in params:
-                g = p.grad
-                state = self.state[p]
+            full_g = torch.cat(recv_list, dim=0)
+            u = zeropower_via_newtonschulz5(full_g, steps=ns_steps)
 
-                # Initialize state if needed
-                if "step" not in state:
-                    state["step"] = 0
-                    state["moment1"] = torch.zeros_like(g, device=p.device)
-                    state["moment2"] = torch.zeros_like(g, device=p.device)
+            # Step 6: Split the processed tensor back for second all_to_all
+            split_sizes = [shape[0] for shape in recv_shapes]
 
-                state["step"] += 1
-                step = state["step"]
+            send_list = list(torch.split(u, split_sizes, dim=0))
+            recv_list = [zero_tensor(shape) for shape in send_shapes]
 
-                # Get momentum buffers
-                buf1 = state["moment1"]
-                buf2 = state["moment2"]
-
-                # Update momentum buffers - safer than lerp
-                buf1.mul_(beta1).add_(g, alpha=1 - beta1)
-                buf2.mul_(beta2).add_(
-                    g * g, alpha=1 - beta2
-                )  # More reliable than g.square()
-
-                # Compute bias corrections
-                bias_correction1 = 1 - beta1**step
-                bias_correction2 = 1 - beta2**step
-                step_size = lr / (bias_correction1 / math.sqrt(bias_correction2))
-
-                # Apply weight decay and update parameters
-                with torch.no_grad():
-                    p.data.mul_(1 - lr * weight_decay)
-                    p.data.addcdiv_(buf1, buf2.sqrt().add_(eps), value=-step_size)
+            # Step 8: Second all_to_all - using ASYNC version
+            dist.all_to_all(recv_list, send_list)
+            del send_list
+            # Step 10: Update parameters using the results
+            self.update_bucket_params(params, recv_list, start_idx, end_idx, lr, wd)
 
     def step(self, closure=None):
-        """Perform a single optimization step.
-
-        Args:
-            closure (Callable, optional): A closure that reevaluates the model
-                and returns the loss.
-        """
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-
-        """
-        So, we have [params] more than world size in general.
-        Hence, we distribute the params across the world_size.
-        Each rank will have a subset of the params = len(params) // world_size
-        """
+        self.update_adamw()
+        ############################################################
+        #       Muon update for parameters with use_muon=True       #
+        ############################################################
 
         world_size = dist.get_world_size()
         rank = dist.get_rank()
 
         for group in self.param_groups:
-            ############################
-            #           Muon           #
-            ############################
+            params = [
+                p
+                for p in group["params"]
+                if self.state[p]["use_muon"] and p.grad is not None
+            ]
+            # sort params by size
+            params.sort(key=lambda x: x.numel(), reverse=True)
 
-            params = [p for p in group["params"] if self.state[p]["use_muon"]]
-            # import pdb; pdb.set_trace()
-            lr = group["lr"]
-            wd = group["wd"]
-            momentum = group["momentum"]
+            lr, wd = group["lr"], group["wd"]
+            momentum, nesterov = group["momentum"], group["nesterov"]
+            ns_steps = group["ns_steps"]
 
-            bucket_size = len(params) // world_size
-            start_idx = rank * bucket_size
-            end_idx = (rank + 1) * bucket_size if rank < world_size - 1 else len(params)
+            bucket_size = world_size
+            # sort params by size
 
-            bucket_params = params[start_idx:end_idx]
+            total_buckets = math.ceil(len(params) / bucket_size)
 
-            # generate weight updates in distributed fashion
-            for idx, p in enumerate(bucket_params):
+            muon_step_fn = self.step_fsdp if self.fsdp_enabled else self.step_ddp
+            muon_step_fn(
+                params,
+                lr,
+                wd,
+                momentum,
+                nesterov,
+                ns_steps,
+                bucket_size,
+                total_buckets,
+                world_size,
+                rank,
+            )
 
-                # sanity check
-                g = p.grad
-                if g is None:
-                    continue
-                if g.ndim > 2:
-                    g = g.view(g.size(0), -1)
-                assert g is not None
-
-                ############################
-                # DISTRIBUTED MUON UPDATE #
-                # Step 1: Gather full gradient across ranks
-
-                # calc update
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-                if group["nesterov"]:
-                    g = g.add(buf, alpha=momentum)
-                else:
-                    g = buf
-
-                g = self.gather_full_grad(g)
-
-                u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
-
-                ############################
-                # DISTRIBUTED MUON UPDATE #
-                # Step 2: Extract the correct shard for this rank
-
-                # Convert `u` to local tensor if it’s a DTensor
-                if isinstance(u, DTensor):
-                    u_local = u.to_local()
-                else:
-                    u_local = u
-
-                # Ensure `u_local` is evenly split across GPUs
-                split_size = u_local.shape[0] // world_size
-                remainder = u_local.shape[0] % world_size
-                if remainder > 0:
-                    pad = torch.zeros(
-                        (world_size - remainder, u_local.shape[1]),
-                        device=u_local.device,
-                        dtype=u_local.dtype,
-                    )
-                    u_local = torch.cat([u_local, pad], dim=0)
-
-                # Now safely split into equal-sized chunks
-                u_chunks = list(torch.split(u_local, split_size, dim=0))
-                # Allocate buffers for received `u` shards
-                u_shards = [torch.zeros_like(u_chunks[0]) for _ in range(world_size)]
-                # Use `all_to_all()` to correctly swap updates between GPUs
-
-                # dist.all_to_all(u_shards, u_chunks)
-
-                work = dist.all_to_all(u_shards, u_chunks, async_op=True)
-                work.wait()  # Synchronize before using u_shards
-                # dist.reduce_scatter(
-                #     u_local, u_chunks, op=dist.ReduceOp.SUM, async_op=True
-                # )
-
-                # Reconstruct correct `u` for this rank
-                u = torch.cat(u_shards, dim=0)  # Now, each GPU has the correct update
-
-                # Convert back to DTensor if needed
-                if isinstance(p.data, DTensor):
-                    u = DTensor.from_local(u, p.data.device_mesh, placements=[Shard(0)])
-
-                ############################
-                # Scale update
-                adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
-
-                # apply weight decay
-                p.data.mul_(1 - lr * wd)
-
-                if u.shape != p.data.shape:
-                    raise RuntimeError(
-                        f"Shape mismatch: u.shape={u.shape}, p.data.shape={p.data.shape}"
-                    )
-
-                # apply update
-                p.data.add_(u, alpha=-adjusted_lr)
-
-                # ok question here is, other ranks does not have the updated p.data
-                # so, we need to broadcast the updated p.data to all ranks
-
-        # For easier debug, we separate the AdamW optimizer
-        ############################
-        #       AdamW backup       #
-        ############################
-        self.update_adamw()
         return loss
