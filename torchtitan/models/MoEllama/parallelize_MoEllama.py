@@ -8,20 +8,16 @@
 # training techniques (e.g. activation checkpointing and compile) to the Llama model.
 
 from collections import defaultdict
-
+from typing import Optional
 import torch
 import torch.nn as nn
-
-from torch.distributed import DeviceMesh
-from torch.distributed._composable.fsdp import (
-    CPUOffloadPolicy,
-    fully_shard,
-    MixedPrecisionPolicy,
-)
 from torch.distributed._composable.replicate import replicate
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
+
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
@@ -79,7 +75,38 @@ def parallelize_llama(
             enable_async_tp=job_config.parallelism.enable_async_tensor_parallel,
         )
 
+    if parallel_dims.ep_enabled:
+        # TODO(FZJ): NEED TO FIX THIS LATER, DONT KNOW IF ITS A PYTORCH BUG OR NOT
+        if parallel_dims.ep_mode != "naive_dp2ep":
+            ep_mesh = None
+        else:
+            if "cp" in world_mesh.mesh_dim_names:
+                ep_mesh = world_mesh["ep"]
+            else:
+                ep_mesh = world_mesh["dp_shard_2"]
+
+        tp_mesh = world_mesh["tp"] if parallel_dims.tp_enabled else None
+
+        for block in model.layers.values():
+            block.feed_forward.experts.setup_ep(ep_mesh, parallel_dims.ep)
+
+        # apply_ep(
+        #     model,
+        #     ep_mode=parallel_dims.ep_mode,
+        #     ep_mesh=ep_mesh,
+        #     tp_mesh=tp_mesh,
+        #     ep_tp_mesh=None,
+        # )
+
     if job_config.activation_checkpoint.mode != "none":
+        if (
+            job_config.activation_checkpoint.mode == "selective"
+            and job_config.model.use_flex_attn
+        ):
+            raise ValueError(
+                "FlexAttention is not compatible with selective AC yet. "
+                "See https://github.com/pytorch/pytorch/issues/147879"
+            )
         apply_ac(model, job_config.activation_checkpoint)
 
     # turn on per-TransformerBlock compile after AC wrapping and before FSDP
@@ -94,6 +121,12 @@ def parallelize_llama(
         else:
             dp_mesh_dim_names = ("dp_shard_cp",)
 
+        dp_mod_ep_mesh_dim_names = []
+        if parallel_dims.ep_mode == "naive_dp2ep" and parallel_dims.ep_enabled:
+            if parallel_dims.dp_replicate_enabled:
+                dp_mod_ep_mesh_dim_names.append("dp_replicate")
+            dp_mod_ep_mesh_dim_names.append("dp_shard_1")
+
         apply_fsdp(
             model,
             world_mesh[tuple(dp_mesh_dim_names)],
@@ -102,6 +135,8 @@ def parallelize_llama(
             pp_enabled=parallel_dims.pp_enabled,
             cpu_offload=job_config.training.enable_cpu_offload,
             reshard_after_forward_policy=job_config.parallelism.fsdp_reshard_after_forward,
+            ep_enabled=(parallel_dims.ep_mode == "naive_dp2ep"),
+            dp_mod_ep_mesh=world_mesh[tuple(dp_mod_ep_mesh_dim_names)],
         )
 
         if parallel_dims.dp_replicate_enabled:
@@ -114,6 +149,7 @@ def parallelize_llama(
 
         if job_config.training.enable_cpu_offload:
             logger.info("Applied CPU Offloading to the model")
+
     elif parallel_dims.dp_replicate_enabled:
         if world_mesh.ndim > 1:
             raise RuntimeError("DDP has not supported > 1D parallelism")
@@ -203,10 +239,12 @@ def apply_tp(
             "feed_forward.w3": colwise_parallel(),
         }
         if isinstance(transformer_block, BitNetTransformerBlock):
-            layer_plan.update({
-                "attention.wo_norm": SequenceParallel(),
-                "feed_forward.w2_norm": SequenceParallel(),
-            })
+            layer_plan.update(
+                {
+                    "attention.wo_norm": SequenceParallel(),
+                    "feed_forward.w2_norm": SequenceParallel(),
+                }
+            )
 
         parallelize_module(
             module=transformer_block,
@@ -226,12 +264,47 @@ def apply_tp(
     )
 
 
+def apply_ep(
+    model: nn.Module,
+    ep_mode: str,
+    ep_mesh: Optional[DeviceMesh] = None,
+    tp_mesh: Optional[DeviceMesh] = None,
+    ep_tp_mesh: Optional[DeviceMesh] = None,
+):
+
+    from torch.distributed.tensor import Partial
+    from torch.distributed.tensor.parallel import PrepareModuleOutput
+    from .expert_parallel import (
+        ExpertParallel,
+        ExpertTensorParallel,
+        PrepareModuleInputOutput,
+        TensorParallel,
+    )
+
+    if ep_mode == "naive_dp2ep":
+        if not tp_mesh:
+            assert ep_mesh is not None
+            for _, transformer_block in model.layers.items():
+                parallelize_module(
+                    module=transformer_block.feed_forward.experts,
+                    device_mesh=ep_mesh,
+                    # input / output sharding on the tokens dim
+                    parallelize_plan=ExpertParallel(
+                        input_layouts=Shard(1),
+                        output_layouts=Shard(1),
+                    ),
+                )
+        else:
+            assert ep_tp_mesh is not None
+
+    logger.info(f"Applied {ep_mode} expert parallelism to the model")
+
+
 # for selective op activation checkpointing
 _save_list = {
     torch.ops.aten.mm.default,
     torch.ops.aten._scaled_dot_product_efficient_attention.default,
     torch.ops.aten._scaled_dot_product_flash_attention.default,
-    torch.ops._c10d_functional.reduce_scatter_tensor.default,
     # for low precision training, it's useful to always save
     # the result of max, since the absolute maximum is
     # used to compute the scaling factor for quantization.
@@ -264,16 +337,21 @@ def _apply_ac_to_transformer_block(module: nn.Module, ac_config):
             CheckpointPolicy,
             create_selective_checkpoint_contexts,
         )
+
         if isinstance(module, BitNetTransformerBlock):
-            _save_list.update({
-                torch.ops.torchao.scaled_int8_mm.default,
-                torch.ops.aten._int_mm.default,
-                torch.ops.aten.mean.default,
-            })
-            mm_funs.extend([
-                torch.ops.torchao.scaled_int8_mm.default,
-                torch.ops.aten._int_mm.default,
-            ])
+            _save_list.update(
+                {
+                    torch.ops.torchao.scaled_int8_mm.default,
+                    torch.ops.aten._int_mm.default,
+                    torch.ops.aten.mean.default,
+                }
+            )
+            mm_funs.extend(
+                [
+                    torch.ops.torchao.scaled_int8_mm.default,
+                    torch.ops.aten._int_mm.default,
+                ]
+            )
 
         def _get_custom_policy(meta):
             def _custom_policy(ctx, func, *args, **kwargs):
@@ -328,7 +406,7 @@ def apply_compile(model: nn.Module):
     repeated structure. Alternatively one can compile the whole model (after applying DP).
     """
     for layer_id, transformer_block in model.layers.named_children():
-        transformer_block = torch.compile(transformer_block)
+        transformer_block = torch.compile(transformer_block, fullgraph=True)
         model.layers.register_module(layer_id, transformer_block)
 
     logger.info("Compiling each TransformerBlock with torch.compile")
@@ -342,6 +420,8 @@ def apply_fsdp(
     pp_enabled: bool,
     cpu_offload: bool = False,
     reshard_after_forward_policy: str = "default",
+    ep_enabled: bool = False,
+    dp_mod_ep_mesh: Optional[DeviceMesh] = None,
 ):
     """
     Apply data parallelism (via FSDP2) to the model.
@@ -361,6 +441,7 @@ def apply_fsdp(
 
     """
     mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+
     fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
@@ -383,6 +464,16 @@ def apply_fsdp(
             raise ValueError(
                 f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."
             )
+
+        fsdp_mod_ep_config = fsdp_config.copy()
+        fsdp_mod_ep_config["mesh"] = dp_mod_ep_mesh
+        # if ep_enabled:
+        #     fully_shard(
+        #         transformer_block.moe.experts,
+        #         **fsdp_mod_ep_config,
+        #         reshard_after_forward=reshard_after_forward,
+        #     )
+
         fully_shard(
             transformer_block,
             **fsdp_config,

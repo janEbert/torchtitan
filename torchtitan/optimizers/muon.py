@@ -47,7 +47,10 @@ class Muon(torch.optim.Optimizer):
         adamw_maximize=False,
         **kwargs,
     ):
-        self.fsdp_enabled = "dp_shard" in world_mesh.mesh_dim_names
+        self.fsdp_enabled = (
+            "dp_shard" in world_mesh.mesh_dim_names
+            or "dp_shard_1" in world_mesh.mesh_dim_names
+        )
         self.world_mesh = world_mesh
 
         if communication_dtype == "bf16":

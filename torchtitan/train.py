@@ -18,11 +18,15 @@ from torch.distributed.elastic.multiprocessing.errors import record
 import torchtitan.components.ft as ft
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import cross_entropy_loss, multi_token_cross_entropy_loss
+from torchtitan.components.loss import (
+    cross_entropy_loss,
+    multi_token_cross_entropy_loss,
+)
 from torchtitan.components.metrics import (
     build_metrics_processor,
     ensure_pp_loss_visible,
 )
+from torchtitan.components.activation_offload import get_act_offloading_ctx_manager
 from torchtitan.config_manager import JobConfig
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.models.MoEllama.loss import moe_loss
@@ -93,6 +97,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 cp=parallelism_config.context_parallel_degree,
                 tp=parallelism_config.tensor_parallel_degree,
                 pp=parallelism_config.pipeline_parallel_degree,
+                ep=parallelism_config.expert_parallel_degree,
+                ep_mode=parallelism_config.expert_parallel_mode,
                 world_size=world_size,
                 enable_loss_parallel=not parallelism_config.disable_loss_parallel,
             )
@@ -103,6 +109,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 cp=parallelism_config.context_parallel_degree,
                 tp=parallelism_config.tensor_parallel_degree,
                 pp=parallelism_config.pipeline_parallel_degree,
+                ep=parallelism_config.expert_parallel_degree,
+                ep_mode=parallelism_config.expert_parallel_mode,
                 world_size=world_size,
                 enable_loss_parallel=not parallelism_config.disable_loss_parallel,
                 ft_manager=ft_manager,
@@ -129,8 +137,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # verify batch sizes
         if job_config.training.global_batch_size is None:
-            job_config.training.global_batch_size = \
+            job_config.training.global_batch_size = (
                 job_config.training.batch_size * dp_degree
+            )
         assert job_config.training.global_batch_size > 0
         assert (
             job_config.training.global_batch_size
@@ -142,9 +151,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"% ({job_config.training.batch_size} * {dp_degree}) != 0)"
         )
 
-        self.gradient_accumulation_steps = (
-            job_config.training.global_batch_size
-            // (job_config.training.batch_size * dp_degree)
+        self.gradient_accumulation_steps = job_config.training.global_batch_size // (
+            job_config.training.batch_size * dp_degree
         )
         assert self.gradient_accumulation_steps > 0
 
@@ -157,8 +165,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if job_config.training.num_mtp_tokens > 0:
             pre_mtp_loss_fn = self.train_spec.loss_fn
-            assert pre_mtp_loss_fn in [cross_entropy_loss, moe_loss], \
-                "MTP requires cross-entropy loss"
+            assert pre_mtp_loss_fn in [
+                cross_entropy_loss,
+                moe_loss,
+            ], "MTP requires cross-entropy loss"
             self.train_spec.loss_fn = functools.partial(
                 multi_token_cross_entropy_loss,
                 loss_fn=pre_mtp_loss_fn,
@@ -336,6 +346,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             ft_manager=ft_manager,
         )
 
+        self.activations_handling_ctx = get_act_offloading_ctx_manager(
+            self.model_parts[0], enable_activation_offloading=False
+        )
+
         self.train_context = dist_utils.get_train_context(
             parallel_dims.loss_parallel_enabled,
             parallelism_config.enable_compiled_autograd,
@@ -389,7 +403,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if parallel_dims.pp_enabled:
             # Pipeline Parallel forward / backward inside step() call
-            with self.train_context(optional_context_parallel_ctx):
+            with self.train_context(
+                optional_context_parallel_ctx, self.activations_handling_ctx
+            ):
                 targets, losses = (
                     (labels, []) if self.pp_has_last_stage else (None, None)
                 )
@@ -447,6 +463,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if hasattr(model, "update_gate_bias"):
                 model.update_gate_bias()
 
+        # TODO(JSC): if we shard the MoE model, we need to remove the following code
+        if parallel_dims.ep_enabled and parallel_dims.ep_mode == "naive_dp2ep":
+            """
+            The reason is the gradinet of routed experts is reduced by the number of experts
+            but the only 1/ep_size of the parameters are updated.
+            """
+            for model in model_parts:
+                for p_name, p in model.named_parameters():
+                    if "feed_forward.experts" in p_name:
+                        p.grad = p.grad / parallel_dims.ep
+
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in model_parts for p in m.parameters()],
             self.job_config.training.max_norm,
@@ -461,7 +488,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         loss = torch.sum(torch.stack(self.metrics_processor.accumulated_losses))
         self.metrics_processor.accumulated_losses.clear()
         if len(self.metrics_processor.accumulated_aux_losses) > 0:
-            aux_loss = torch.sum(torch.stack(self.metrics_processor.accumulated_aux_losses))
+            aux_loss = torch.sum(
+                torch.stack(self.metrics_processor.accumulated_aux_losses)
+            )
             self.metrics_processor.accumulated_aux_losses.clear()
         if len(self.metrics_processor.accumulated_moe_entropy_per_layer) > 0:
             moe_entropy_per_layer = {}
@@ -504,16 +533,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if aux_loss is not None:
             extra_log_data["loss_metrics/aux_loss"] = aux_loss
         if moe_entropy_per_layer is not None:
-            for (k, v) in moe_entropy_per_layer.items():
+            for k, v in moe_entropy_per_layer.items():
                 extra_log_data[f"loss_metrics/moe_entropy_per_layer_{k}"] = v
 
         color = self.metrics_processor.color
-        extra_print_data = (
-            f"  {color.green}gradnorm: {grad_norm:7.4f}{color.reset}"
-        )
+        extra_print_data = f"  {color.green}gradnorm: {grad_norm:7.4f}{color.reset}"
 
         self.metrics_processor.log(
-            self.step, global_avg_loss, global_max_loss, extra_log_data, extra_print_data,
+            self.step,
+            global_avg_loss,
+            global_max_loss,
+            extra_log_data,
+            extra_print_data,
         )
 
     @record
@@ -523,11 +554,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         trainer.checkpointer.load(step=job_config.checkpoint.load_step)
         logger.info(f"Training starts at step {self.step + 1}.")
 
-        with maybe_enable_profiling(
-            job_config, global_step=self.step
-        ) as torch_profiler, maybe_enable_memory_snapshot(
-            job_config, global_step=self.step
-        ) as memory_profiler:
+        with (
+            maybe_enable_profiling(job_config, global_step=self.step) as torch_profiler,
+            maybe_enable_memory_snapshot(
+                job_config, global_step=self.step
+            ) as memory_profiler,
+        ):
             data_iterator = iter(self.dataloader)
             while self.step < job_config.training.steps:
                 self.step += 1

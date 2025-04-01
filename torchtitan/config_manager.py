@@ -243,7 +243,10 @@ class JobConfig:
             "--optimizer.eps", type=float, default=1e-8, help="Epsilon value to use"
         )
         self.parser.add_argument(
-            "--optimizer.weight_decay", type=float, default=0.1, help="Weight decay value to use"
+            "--optimizer.weight_decay",
+            type=float,
+            default=0.1,
+            help="Weight decay value to use",
         )
         self.parser.add_argument(
             "--optimizer.implementation",
@@ -314,7 +317,10 @@ class JobConfig:
 
         # training configs
         self.parser.add_argument(
-            "--training.dataset", type=string_list, default=["c4_test"], help="Dataset to use"
+            "--training.dataset",
+            type=string_list,
+            default=["c4_test"],
+            help="Dataset to use",
         )
         self.parser.add_argument(
             "--training.dataset_path",
@@ -350,7 +356,9 @@ class JobConfig:
                 packing. If not given, only mix in batch dimenison.""",
         )
         self.parser.add_argument(
-            "--training.dataset_inner_name", type=string_list, help="Dataset name to use"
+            "--training.dataset_inner_name",
+            type=string_list,
+            help="Dataset name to use",
         )
         self.parser.add_argument(
             "--training.dataset_files",
@@ -384,7 +392,7 @@ class JobConfig:
             help=(
                 "Global batch size "
                 "(defaults to `training.batch_size * data-parallel degree`)"
-            )
+            ),
         )
         self.parser.add_argument(
             "--training.seq_len", type=int, default=2048, help="Sequence length"
@@ -393,13 +401,13 @@ class JobConfig:
             "--training.num_mtp_tokens",
             type=int,
             default=0,
-            help="Number of tokens to predict at once using multi-token prediction."
+            help="Number of tokens to predict at once using multi-token prediction.",
         )
         self.parser.add_argument(
             "--training.mtp_loss_weight",
             type=int,
             default=0.3,
-            help="Weight of multi-token prediction loss term."
+            help="Weight of multi-token prediction loss term.",
         )
         self.parser.add_argument(
             "--training.max_norm",
@@ -608,6 +616,20 @@ class JobConfig:
 
                 The default value is 'allgather'.
             """,
+        )
+
+        self.parser.add_argument(
+            "--parallelism.expert_parallel_degree",
+            type=int,
+            default=1,
+            help="Expert Parallelism degree. 1 means disabled.",
+        )
+        self.parser.add_argument(
+            "--parallelism.expert_parallel_mode",
+            type=str,
+            default="none",
+            choices=["naive_dp2ep", "none"],
+            help="Expert Parallelism mode. ",
         )
 
         # checkpointing configs
