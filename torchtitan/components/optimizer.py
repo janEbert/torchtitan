@@ -8,6 +8,7 @@ import functools
 import math
 from typing import Any, Dict, Generic, List, TypeVar
 import re
+import copy
 from collections import OrderedDict
 
 import torch
@@ -17,6 +18,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
     StateDictOptions,
 )
+from torch.distributed import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate
 from torch.optim import Optimizer, Adam, AdamW
@@ -364,7 +366,8 @@ class FTOptimizersContainer(OptimizersContainer):
 def build_optimizers(
     model_parts: List[nn.Module],
     job_config: JobConfig,
-    ft_manager: FTManager
+    ft_manager: FTManager,
+    world_mesh: DeviceMesh = None,
 ) -> OptimizersContainer:
     """Create a OptimizersContainer for the given model parts and job config.
 
@@ -456,6 +459,9 @@ def build_optimizers(
         }
     else:
         raise NotImplementedError(f"Optimizer {name} not added.")
+    
+    if "Muon" in name or name == "Scion":
+        optimizer_kwargs["world_mesh"] = world_mesh
 
     optimizer_classes = {
         "Adam": Adam,

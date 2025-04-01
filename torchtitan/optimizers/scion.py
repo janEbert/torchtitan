@@ -58,14 +58,13 @@ zeropower_backends = dict(svd=zeropower_via_svd,
 class Scion(torch.optim.Optimizer):
 
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, eps=1e-7, norm_factor='none',
-                 backend='newtonschulz5', backend_steps=5, dp_mesh=None):
+                 backend='newtonschulz5', backend_steps=5, world_mesh=None):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, 
                         eps=eps, norm_factor=norm_factor, 
                         backend=backend, backend_steps=backend_steps)
-        self.fsdp_enabled = dp_mesh is not None
-        self.dp_mesh = dp_mesh  # DeviceMesh for DP communication
+        self.fsdp_enabled = "dp_shard" in world_mesh.mesh_dim_names
         print(
-            f"Scion optimizer is enabled with dp_mesh={dp_mesh} | fsdp_enabled={self.fsdp_enabled}"
+            f"Scion optimizer is enabled with world_mesh={world_mesh} | fsdp_enabled={self.fsdp_enabled}"
         )
         super().__init__(params, defaults)
 

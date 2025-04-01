@@ -24,7 +24,6 @@ enable_wandb = true
 wandb_project = "test-project"
 wandb_group = "test-group"
 wandb_name = "test-run"
-rank_0_only = true
 
 [model]
 name = "bit_byte_llama3"
@@ -62,15 +61,15 @@ seq_len = 4096
 batch_size = 4
 global_batch_size = 4
 max_norm = 1  # grad norm clipping
+compile = false
+
+[parallelism]
 data_parallel_replicate_degree = 1
 data_parallel_shard_degree = -1
 fsdp_reshard_after_forward = "default" # default / never / always
 tensor_parallel_degree = 1
-compile = false
 mixed_precision_param = "bfloat16"
 mixed_precision_reduce = "float32"
-
-[experimental]
 context_parallel_degree = 1
 pipeline_parallel_degree = 1
 enable_async_tensor_parallel = false
