@@ -1,8 +1,6 @@
 import os
 import torch
-from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Replicate, Shard
-from .muon_utils import zeropower_backends
+from torchtitan.optimizers.muon_utils import zeropower_backends, gather_full_grad, shard_full_grad
 
 __all__ = [
     'Scion',
@@ -23,25 +21,6 @@ class Scion(torch.optim.Optimizer):
                 with world_mesh={world_mesh} | fsdp_enabled={self.fsdp_enabled}"
         )
         super().__init__(params, defaults)
-
-    def gather_full_grad(self, g):
-        """Gathers the full gradient across all distributed processes using DTensor."""
-        if not self.fsdp_enabled:
-            return g  # No sharding, return the original gradient
-
-        assert isinstance(g, DTensor), "Expected gradient to be a DTensor"
-
-        replicated_grad = g.redistribute(
-            placements=[Replicate()] * g.device_mesh.ndim
-        )  # make sure all rank has the same shape
-        return replicated_grad
-    
-    def shard_grad(self, g):
-        """Extracts the correct shard for the current rank from a replicated DTensor."""
-        if not self.fsdp_enabled:
-            return g
-        
-        return g.redistribute(placements=[Shard(0)])
     
     @torch.no_grad()
     def step(self, closure=None):
@@ -78,8 +57,11 @@ class Scion(torch.optim.Optimizer):
                     buf.mul_(1-momentum).add_(g, alpha=momentum)
                     g = buf if not nesterov else buf.mul(1-momentum).add(g, alpha=momentum)
 
+                if self.fsdp_enabled:
+                    g = gather_full_grad(g)
                 update = self.lmo(g, **param_kwargs)
-                update = self.shard_grad(update)
+                if self.fsdp_enabled:
+                    update = shard_full_grad(update)
                 if update.shape != p.data.shape:
                     raise RuntimeError(
                         f"Shape mismatch: g.shape={g.shape}, p.data.shape={p.data.shape}"
@@ -98,7 +80,6 @@ class Scion(torch.optim.Optimizer):
     def lmo(self, g, eps, norm_factor, zeropower_backend, backend_steps):
         ### NB: make sure this function does not modify the grad inplace
         ###     since it is also called during the log of gradients
-        g = self.gather_full_grad(g)
         g = zeropower_backend(g, steps=backend_steps, eps=eps)
         g = self.normalise_grad(g, norm_factor=norm_factor, eps=eps)
 
