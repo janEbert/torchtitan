@@ -93,6 +93,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 cp=parallelism_config.context_parallel_degree,
                 tp=parallelism_config.tensor_parallel_degree,
                 pp=parallelism_config.pipeline_parallel_degree,
+                ep=parallelism_config.expert_parallel_degree,
+                ep_mode=parallelism_config.expert_parallel_mode,
                 world_size=world_size,
                 enable_loss_parallel=not parallelism_config.disable_loss_parallel,
             )
@@ -103,6 +105,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 cp=parallelism_config.context_parallel_degree,
                 tp=parallelism_config.tensor_parallel_degree,
                 pp=parallelism_config.pipeline_parallel_degree,
+                ep=parallelism_config.expert_parallel_degree,
+                ep_mode=parallelism_config.expert_parallel_mode,
                 world_size=world_size,
                 enable_loss_parallel=not parallelism_config.disable_loss_parallel,
                 ft_manager=ft_manager,
@@ -446,6 +450,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         for model in model_parts:
             if hasattr(model, "update_gate_bias"):
                 model.update_gate_bias()
+
+        # TODO(JSC): if we shard the MoE model, we need to remove the following code
+        if parallel_dims.ep_enabled and parallel_dims.ep_mode == "naive_dp2ep":
+            """
+            The reason is the gradinet of routed experts is reduced by the number of experts
+            but the only 1/ep_size of the parameters are updated.
+            """
+            for model in model_parts:
+                for p_name, p in model.named_parameters():
+                    if "feed_forward.experts" in p_name:
+                        p.grad = p.grad * parallel_dims.ep
 
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in model_parts for p in m.parameters()],

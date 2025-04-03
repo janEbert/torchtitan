@@ -1,6 +1,6 @@
 from dataclasses import dataclass
-from functools import partial
-from typing import NotRequired, Optional, TypedDict, Union
+import math
+from typing import NotRequired, Optional, Union, Callable
 
 from einops import rearrange
 import torch
@@ -11,6 +11,10 @@ from torch.distributed.tensor import DTensor, Replicate
 from torchtitan.models.llama.model import Attention, precompute_freqs_cis, TransformerInputsDict
 from torchtitan.models.norms import build_norm
 from torchtitan.protocols.train_spec import BaseModelArgs, ModelProtocol
+
+from torchtitan.components.tokenizer import Tokenizer
+from torchtitan.config_manager import JobConfig
+from torchtitan.tools.logging import logger
 
 
 @dataclass
@@ -33,14 +37,42 @@ class MoEModelArgs(BaseModelArgs):
     qk_norm: bool = False
 
     # ==== MoE specific args ====
-    # shared_experts: int = 2
-    # n_routed_experts: int = 8
-    # activate_experts: int = 2
-    shared_experts: int = 2
-    activate_experts: int = 2
-    n_routed_experts: int = 8
+    n_shared_experts: int = 1
+    n_routed_experts: int = 0
+    activate_experts: int = 0
     moe_gate_bias_update_speed: float = 0.01
     moe_aux_loss_alpha: float = 0.01
+
+    def update_from_config(self, job_config: JobConfig, tokenizer: Tokenizer) -> None:
+        self.norm_type = job_config.model.norm_type
+        self.vocab_size = tokenizer.n_words
+        if job_config.model.vocab_size_multiple_of:
+            vocab_divisor = job_config.model.vocab_size_multiple_of
+            self.vocab_size = int(
+                math.ceil(self.vocab_size / vocab_divisor) * vocab_divisor
+            )
+            logger.info(
+                f"Padded vocab size from {tokenizer.n_words} to {self.vocab_size}."
+            )
+        self.max_seq_len = job_config.training.seq_len
+        self.use_flex_attn = job_config.model.use_flex_attn
+
+    def get_num_flop_per_token(self, num_params: int, seq_len: int) -> int:
+        l, h, q, t = (
+            self.n_layers,
+            self.n_heads,
+            self.dim // self.n_heads,
+            seq_len,
+        )
+        # Reasoning behind the factor of 12 for the self-attention part of the formula:
+        # 1. each self-attention has 2 matmul in the forward and 4 in the backward (6)
+        # 2. the flash attention does 1 more matmul recomputation in the backward
+        #    but recomputation should not be counted in calculating MFU           (+0)
+        # 3. each matmul performs 1 multiplication and 1 addition                 (*2)
+        # 4. we follow the convention and do not account for sparsity in causal attention
+        flop_per_token = 6 * num_params + 12 * l * h * q * t
+
+        return flop_per_token
 
 
 class MoEInputsDict(TransformerInputsDict):
@@ -71,18 +103,22 @@ class Gate(nn.Module):
         self._accumulated_adjustment = None
         self._num_accumulated = 0
 
-    @torch.compiler.disable()
+    def __repr__(self):
+        return f"Gate(experts={self.experts}, topk={self.topk}, bias={self.bias is not None})"
+
     def forward(self, x: torch.Tensor, update_bias: bool = False) -> torch.Tensor:
         """
         Args:
             x: Input tensor of shape (B*S, D)
             update_bias: Whether to accumulate bias adjustments (only during training)
         Returns:
-            weights: Normalized routing weights (B*S, K)
-            indices: Selected expert indices (B*S, K)
+            weights: Normalized routing weights
+            indices: Selected expert indices
+            scores: Expert selection scores
         """
         # Compute expert selection scores (sigmoid-based gating)
-        scores = torch.sigmoid(x @ self.expert_embeddings.T)  # (B*S, N_r)
+        scores = x @ self.expert_embeddings.T
+        scores = torch.sigmoid(scores.to(torch.float32)).to(x.dtype)  # (B*S, N_r)
 
         if self.bias is not None:
             scores = scores + self.bias  # Add bias term to improve balance
@@ -94,8 +130,8 @@ class Gate(nn.Module):
         weights = scores.gather(-1, indices)
         weights = weights / weights.sum(dim=-1, keepdim=True)
 
-        if update_bias and self.bias is not None:
-            self._accumulate_adjustment(indices)
+        # if update_bias and self.bias is not None:
+        #     self._accumulate_adjustment(indices)
 
         return weights.type_as(x), indices, scores
 
@@ -163,6 +199,216 @@ class Gate(nn.Module):
         self._num_accumulated = 0
 
 
+class GroupedExperts(nn.Module):
+    """This class implements the grouped experts layer used in Mixture of Experts. Each expert
+    is a variant of the Gated Linear Units network. See more details in https://arxiv.org/pdf/2002.05202.
+
+    Args:
+        dim_in (int): Input dimension.
+        dim_out (int): Output dimension.
+        num_experts (int): Number of experts in this grouped experts layer. Default is 1.
+        swiglu (bool): Whether to use gated linear unit. Default is True.
+        activation (nn.Module): Activation function to use. Default is F.silu.
+    """
+
+    ep_mesh = None
+    ep_size = None
+    local_rank = None
+
+    def __init__(
+        self,
+        *,
+        dim_in: int,
+        dim_out: int,
+        num_experts: int = 1,
+        swiglu: bool = True,
+        activation: Callable = F.silu,
+    ):
+        super().__init__()
+        self.dim_in = dim_in
+        self.num_experts = num_experts
+        self.dim_out = dim_out
+
+        if num_experts == 1:
+            self.gate_proj = nn.Linear(dim_in, dim_out)
+            self.down_proj = nn.Linear(dim_out, dim_in)
+        else:
+            self.gate_proj = nn.Parameter(torch.empty(num_experts, dim_in, dim_out))
+            self.down_proj = nn.Parameter(torch.empty(num_experts, dim_out, dim_in))
+        self.swiglu = swiglu
+        if swiglu:
+            if num_experts == 1:
+                self.up_proj = nn.Linear(dim_in, dim_out)
+            else:
+                self.up_proj = nn.Parameter(torch.empty(num_experts, dim_in, dim_out))
+            self.act_fn = F.silu
+        else:
+            self.up_proj = None
+            self.act_fn = activation
+
+    def __repr__(self):
+        return f"GroupedExperts(dim_in={self.dim_in}, dim_hidden={self.dim_out}, num_experts={self.num_experts}, swiglu={self.swiglu})"
+
+    def setup_ep(self, ep_mesh=None, ep_size=None):
+        self.ep_mesh = ep_mesh
+        self.ep_size = ep_size
+        if self.ep_mesh is not None:
+            self.local_rank = self.ep_mesh.get_local_rank()
+
+    @staticmethod
+    def dispatch_tokens(
+        x, tokens_per_expert, dim_in, expert_per_rank, ep_size, ep_mesh
+    ):
+        """
+        Dispatch tokens to corresponding experts using all_to_all.
+
+        Args:
+            x: Tensor of shape (num_experts * tokens_per_expert, dim_in)
+            tokens_per_expert: int, number of tokens per expert
+            dim_in: int, input dimension
+            k: int, number of experts per EP rank
+            ep_size: int, number of EP ranks (world size)
+            ep_mesh: torch.distributed process group for EP parallel
+
+        Returns:
+            output: Tensor of shape (num_experts * tokens_per_expert, dim_in)
+        """
+
+        # x shape: (num_experts, tokens_per_expert, dim_in)
+        # num_experts = expert_per_rank * ep_size
+        x = x.view(
+            ep_size, expert_per_rank * tokens_per_expert, dim_in
+        )  # shape: (ep_size, expert_per_rank * tokens_per_expert, dim_in)
+
+        # Create input list (1 tensor per rank, each must be contiguous)
+        input_tensor_list = [x[i].contiguous() for i in range(ep_size)]
+
+        # Prepare empty output tensors
+        output_tensor_list = [
+            torch.empty_like(input_tensor_list[0]) for _ in range(ep_size)
+        ]
+
+        # All-to-all communication
+        torch.distributed.all_to_all(
+            output_tensor_list,
+            input_tensor_list,
+            group=ep_mesh.get_group(),
+        )
+
+        # Concatenate output
+        output = torch.cat(output_tensor_list, dim=0).view(
+            expert_per_rank, tokens_per_expert * ep_size, dim_in
+        )
+
+        return output
+
+    def gather_tokens(x, tokens_per_expert, dim_in, expert_per_rank, ep_size, ep_mesh):
+        """
+        Gather tokens from experts back to original shape using all_to_all.
+
+        Args:
+            x: Tensor of shape (expert_per_rank, tokens_per_expert * ep_size, dim_in)
+            tokens_per_expert: int
+            dim_in: int
+            expert_per_rank: int
+            ep_size: int
+            ep_mesh: DeviceMesh
+
+        Returns:
+            output: Tensor of shape (num_experts, tokens_per_expert, dim_in)
+        """
+        # Reshape to (ep_size, expert_per_rank * tokens_per_expert, dim_in)
+        x = x.view(ep_size, expert_per_rank * tokens_per_expert, dim_in)
+
+        # Split into chunks to send back to each rank
+        input_tensor_list = [x[i].contiguous() for i in range(ep_size)]
+
+        # Prepare empty outputs
+        output_tensor_list = [
+            torch.empty_like(input_tensor_list[0]) for _ in range(ep_size)
+        ]
+
+        # Reverse all-to-all (same as forward in PyTorch)
+        torch.distributed.all_to_all(
+            output_tensor_list,
+            input_tensor_list,
+            group=ep_mesh.get_group(),
+        )
+
+        # Final reshape
+        output = torch.cat(output_tensor_list, dim=0).view(
+            expert_per_rank * ep_size, tokens_per_expert, dim_in
+        )
+
+        return output
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): with shape (num_experts, tokens_per_expert, dim_in) for Expert Choice(EC).
+
+        Returns:
+            torch.Tensor: with shape (num_experts, tokens_per_expert, dim_in) for Expert Choice(EC).
+        """
+        # Expert Choice(EC) forward
+        # x shape (num_experts, tokens_per_expert, dim_in)
+        num_experts, tokens_per_expert, dim_in = x.shape
+        if self.ep_size is not None and self.ep_size > 1:
+            # This code is used for EP
+            expert_per_rank = num_experts // self.ep_size
+            x = self.dispatch_tokens(
+                x,
+                tokens_per_expert,
+                dim_in,
+                expert_per_rank,
+                self.ep_size,
+                self.ep_mesh,
+            )
+
+        if self.num_experts > 1:
+            if self.ep_size is not None and self.ep_size > 1:
+                # This code is used for EP
+                lee = self.local_rank * expert_per_rank
+                les = (self.local_rank + 1) * expert_per_rank
+
+                h = self.act_fn(torch.bmm(x, self.gate_proj[lee:les]))
+                if self.up_proj is not None:
+                    h = h * torch.bmm(x, self.up_proj[lee:les])
+                out = torch.bmm(h, self.down_proj[lee:les])
+                out = out.view(
+                    num_experts, tokens_per_expert, dim_in
+                )  # this actaull does not matter
+
+            else:
+                h = self.act_fn(torch.bmm(x, self.gate_proj))
+                if self.up_proj is not None:
+                    h = h * torch.bmm(x, self.up_proj)
+                out = torch.bmm(h, self.down_proj)
+
+        else:
+            out = self.act_fn(self.gate_proj(x))
+            if self.up_proj is not None:
+                out = out * self.up_proj(x)
+            out = self.down_proj(out)
+
+        return out
+
+    def init_weights(self, init_std: float):
+        if self.num_experts > 1:
+            nn.init.trunc_normal_(self.gate_proj, mean=0.0, std=init_std)
+            nn.init.trunc_normal_(self.down_proj, mean=0.0, std=init_std)
+            if self.up_proj is not None:
+                nn.init.trunc_normal_(self.up_proj, mean=0.0, std=init_std)
+        else:
+            nn.init.trunc_normal_(self.gate_proj.weight, mean=0.0, std=init_std)
+            nn.init.trunc_normal_(self.down_proj.weight, mean=0.0, std=init_std)
+            if self.up_proj is not None:
+                nn.init.trunc_normal_(self.up_proj.weight, mean=0.0, std=init_std)
+
+
 class FeedForward(nn.Module):
     """
     FeedForward module
@@ -184,8 +430,16 @@ class FeedForward(nn.Module):
         self,
         dim: int,
         hidden_dim: int,
+        multiple_of: int,
+        ffn_dim_multiplier: Optional[float],
     ):
         super().__init__()
+        hidden_dim = int(2 * hidden_dim / 3)
+        # custom dim factor multiplier
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
@@ -204,7 +458,7 @@ class MoE(nn.Module):
         self,
         dim: int,
         multiple_of: int = 256,
-        shared_experts: int = 2,
+        n_shared_experts: int = 2,
         n_routed_experts: int = 8,
         activate_experts: int = 2,
         ffn_dim_multiplier: Optional[float] = None,
@@ -219,28 +473,24 @@ class MoE(nn.Module):
         Saying the dense model have the 'hidden_size' of 1024, 
         Then "actual_dim * activate_experts = hidden_size" should be satisfied.
         """
-        assert (
-            shared_experts > 0
-        ), "when moved from my libs to this one, something goes wrong for shared_experts=0"
+
         if match_dim_with_dense:
-            total_activate_experts = shared_experts + activate_experts
-            ratio = total_activate_experts / (n_routed_experts + shared_experts)
+            total_activate_experts = n_shared_experts + activate_experts
+            ratio = total_activate_experts / (n_routed_experts + n_shared_experts)
         else:
             ratio = 1.0
-        hidden_dim = 4 * dim
-        hidden_dim = int(2 * hidden_dim / 3 * ratio)
-        if ffn_dim_multiplier is not None:
-            hidden_dim = int(ffn_dim_multiplier * hidden_dim * 1.0)
-        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        mlp_func = partial(
-            FeedForward,
-            dim=dim,
-            hidden_dim=hidden_dim,
-        )
+        hidden_dim = 4 * dim
+        hidden_dim = int(2 * hidden_dim / 3)
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+        hidden_dim = int(hidden_dim * ratio)
+
+        hidden_dim += -hidden_dim % multiple_of
+
         self.n_routed_experts = n_routed_experts
         self.topk = activate_experts
-        self.shared_experts = shared_experts
+        self.n_shared_experts = n_shared_experts
         self.aux_loss_alpha = aux_loss_alpha  # Loss coefficient
 
         # Use updated Gate with DeepSeekMoE-style routing and bias balancing
@@ -253,77 +503,83 @@ class MoE(nn.Module):
         )
 
         # Shared Experts (applies to all tokens)
-        if shared_experts > 0:
-            self.shared_experts = nn.ModuleList(
-                [mlp_func() for _ in range(shared_experts)]
+        if n_shared_experts > 0:
+            self.shared_experts = GroupedExperts(
+                dim_in=dim, dim_out=hidden_dim, num_experts=n_shared_experts
             )
 
         else:
             self.shared_experts = None
 
         # Routed Experts (only used when selected)
-        self.experts = nn.ModuleList([mlp_func() for _ in range(n_routed_experts)])
+        if n_routed_experts > 0:
+            self.experts = GroupedExperts(
+                dim_in=dim, dim_out=hidden_dim, num_experts=n_routed_experts
+            )
+
+        else:
+            self.experts = None
 
     def init_weights(self, init_std: float):
-        for expert in self.experts:
-            expert.init_weights(init_std)
+        if self.experts is not None:
+            self.experts.init_weights(init_std)
         if self.shared_experts is not None:
-            for expert in self.shared_experts:
-                expert.init_weights(init_std)
+            self.shared_experts.init_weights(init_std)
 
     def update_gate_bias(self):
         self.gate.update()
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        B, S, D = x.size()
+        bz, slen, dim = x.shape
         x = rearrange(x, "b s d -> (b s) d")  # Flatten batch & sequence
+        out = torch.zeros_like(x)
 
+        if self.topk > 0:
+            weights, indices, scores = self.gate(
+                x, update_bias=self.training
+            )  # (B*S, K), (B*S, K)
+            _, num_experts = scores.shape
+            # routed_input shape (num_experts*tokens_per_expert, dim)
+            choosen_indices = indices.reshape(-1, 1).expand(-1, dim)
+            # routed_input shape (num_experts*tokens_per_expert, dim)
+            routed_input = torch.gather(x, dim=0, index=choosen_indices)
+            routed_input = routed_input * weights.reshape(-1, 1)
+            # routed_input shape (num_experts, tokens_per_expert, dim_in)
+            routed_input = routed_input.reshape(num_experts, -1, dim)
+            # routed_output shape (num_experts, tokens_per_expert, dim_out)
+            routed_output = self.experts(routed_input)
+            # routed_output shape (num_experts*tokens_per_expert, dim_out)
+            routed_output = routed_output.reshape(-1, dim)
+
+            out = out.scatter_add(dim=0, index=choosen_indices, src=routed_output)
+
+        # Apply shared experts if they exist
         if self.shared_experts is not None:
-            shared_outputs = torch.stack(
-                [expert(x) for expert in self.shared_experts], dim=0
-            )  # (num_shared, B*S, D)
-            shared_outputs = shared_outputs.mean(dim=0)
-        else:
-            shared_outputs = torch.zeros_like(x)
+            # Reshape input for shared experts: (1, B*S, dim)
+            shared_input = x.reshape(1, bz * slen, dim)
+            # Get shared expert outputs: (1, B*S, dim)
+            shared_output = self.shared_experts(shared_input)
+            # Reshape back to (B*S, dim) and add to output
+            shared_output = shared_output.reshape(bz * slen, dim)
+            out = out + shared_output
 
-        # Get routing weights and indices (update bias only during training)
-        weights, indices, scores = self.gate(
-            x, update_bias=self.training
-        )  # (B*S, K), (B*S, K)
-
-        # Efficient parallel expert execution
-        routed_outputs = torch.zeros_like(x)
-        unique_experts = indices.unique()
-
-        for i in unique_experts:
-            # Find tokens assigned to expert i
-            idx = torch.where(indices == i)  # idx = (batch_indices, topk_indices)
-
-            if idx[0].numel() > 0:  # Ensure at least one token is routed to this expert
-                expert_inputs = x[idx[0]]  # Select the corresponding inputs
-                expert_weights = weights[idx]  # Select corresponding weights
-
-                # Apply expert function
-                expert_output = self.experts[i](expert_inputs)
-
-                routed_outputs[idx[0]] += expert_output * expert_weights.unsqueeze(-1)
-
-        if self.training and self.aux_loss_alpha > 0:
+        if self.training and self.aux_loss_alpha > 0 and self.topk > 0:
             aux_loss = self.sequence_wise_aux_loss(
                 indices,
                 weights,
                 scores,
-                B,
-                S,
+                bz,
+                slen,
             )
         else:
             aux_loss = torch.tensor(0.0, device=x.device)
 
-        routing_entropy = -(weights * weights.log()).sum(dim=-1).mean()
+        if self.topk > 0:
+            routing_entropy = -(weights * weights.log()).sum(dim=-1).mean()
+        else:
+            routing_entropy = torch.tensor(0.0, device=x.device)
 
-        output = rearrange(
-            shared_outputs + routed_outputs, "(b s) d -> b s d", b=B, s=S
-        )
+        output = rearrange(out, "(b s) d -> b s d", b=bz, s=slen)
         return output, aux_loss, routing_entropy
 
     def sequence_wise_aux_loss(
@@ -417,7 +673,7 @@ class TransformerBlock(nn.Module):
             dim=model_args.dim,
             multiple_of=model_args.multiple_of,
             ffn_dim_multiplier=model_args.ffn_dim_multiplier,
-            shared_experts=model_args.shared_experts,
+            n_shared_experts=model_args.n_shared_experts,
             n_routed_experts=model_args.n_routed_experts,
             activate_experts=model_args.activate_experts,
             bias_update_speed=model_args.moe_gate_bias_update_speed,
@@ -499,6 +755,10 @@ class Transformer(nn.Module, ModelProtocol):
         self.model_args = model_args
         self.vocab_size = model_args.vocab_size
         self.n_layers = model_args.n_layers
+
+        print(
+            f"model_args.dim = {model_args.dim} | model_args.vocab_size = {model_args.vocab_size}"
+        )
 
         self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
 
