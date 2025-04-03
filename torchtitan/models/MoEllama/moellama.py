@@ -36,6 +36,8 @@ class MoEModelArgs(BaseModelArgs):
     norm_type: str = "rmsnorm"
     qk_norm: bool = False
 
+    use_flex_attn: bool = False
+
     # ==== MoE specific args ====
     n_shared_experts: int = 1
     n_routed_experts: int = 0
