@@ -276,6 +276,12 @@ class JobConfig:
             "--optimizer.weight_decay", type=float, default=0.1, help="Weight decay value to use"
         )
         self.parser.add_argument(
+            "--optimizer.is_light", action="store_true", help="[Only for Scion] Whether to use its light version"
+        )
+        self.parser.add_argument(
+            "--optimizer.is_unconstrained", action="store_true", help="[Only for Scion] Whether to use its unconstrained version"
+        )
+        self.parser.add_argument(
             "--optimizer.backend_steps", type=int, help="Number of steps for the Scion backend"
         )
         self.parser.add_argument(

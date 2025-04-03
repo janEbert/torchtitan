@@ -171,7 +171,24 @@ class OptimizersContainer(Optimizer, Generic[T]):
     @staticmethod
     def compute_grad(p, optimizer=None, **kwargs):
         if isinstance(optimizer, Scion):
-            return optimizer._compute_grad(p, **kwargs)
+            g = p.grad
+            if g is None or not p.requires_grad:
+                return None
+            
+            momentum = kwargs.pop('momentum')
+            nesterov = kwargs.pop('nesterov')
+            if not optimizer.is_light and momentum != 1:
+                state = optimizer.state[p]
+                if 'momentum_buffer' not in state.keys():
+                    raise ValueError(
+                        "Momentum buffer not found in optimizer state. \
+                            Please check if the optimizer is initialized correctly."
+                    )
+                buf = state['momentum_buffer']
+                buf = buf.mul(1-momentum).add(g, alpha=momentum)
+                g = buf if not nesterov else buf.mul(1-momentum).add(g, alpha=momentum)
+
+            return optimizer.lmo(g, **kwargs)
         elif isinstance(optimizer, AdamW) or isinstance(optimizer, Adam):
             eps = kwargs['eps']
             weight_decay = kwargs['weight_decay']
@@ -432,8 +449,11 @@ def build_optimizers(
         backend_steps = job_config.optimizer.backend_steps
         momentum = job_config.optimizer.momentum
         nesterov = job_config.optimizer.nesterov
-
+        is_light = job_config.optimizer.is_light
+        is_unconstrained = job_config.optimizer.is_unconstrained
         optimizer_kwargs = {
+                "is_light": is_light,
+                "is_unconstrained": is_unconstrained,
                 "lr": lr,
                 'momentum': momentum,
                 'nesterov': nesterov,

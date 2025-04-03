@@ -417,7 +417,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return loss, aux_loss, moe_entropy_per_layer
 
     def train_step(self, data_iterator: Iterable):
-        self.optimizers.zero_grad()
+        if not ("Scion" in self.job_config.optimizer.name and self.job_config.optimizer.is_light):
+            self.optimizers.zero_grad()
 
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
