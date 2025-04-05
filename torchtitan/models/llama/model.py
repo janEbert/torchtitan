@@ -190,27 +190,27 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
 
-def orthogonal_(parameters, gain=1.0, generator=None):
+def orthogonal_(params, gain=1.0, generator=None):
     from torch.distributed.tensor import DTensor, Replicate
 
-    if isinstance(parameters, nn.Parameter):
-        tensor = parameters.data
+    if not isinstance(params.data, DTensor):
+        return nn.init.orthogonal_(params, gain=gain, generator=generator)
     else:
-        tensor = parameters
-
-    if not isinstance(tensor, DTensor):
-        return nn.init.orthogonal_(tensor, gain=gain, generator=generator)
-
-    zeros = torch.zeros(tensor.shape, dtype=tensor.dtype, device=tensor.device)
-    nn.init.orthogonal_(zeros, gain=gain, generator=generator)
-
-    zeros = DTensor.from_local(
-        zeros,
-        placements=[Replicate()] * tensor.device_mesh.ndim,
-        device_mesh=tensor.device_mesh,
-    ).redistribute(placements=tensor.placements)
-
-    tensor.data = zeros
+        temp_tensor = torch.empty(params.shape) # full shape
+        torch.nn.init.orthogonal_(temp_tensor, gain=gain)
+        
+        # Create a replicated DTensor
+        replicated = DTensor.from_local(temp_tensor, 
+                                        placements=[Replicate()] * params.device_mesh.ndim,
+                                        device_mesh=params.device_mesh)
+        
+        # Reshard to match original dtensor's placement
+        resharded = replicated.redistribute(placements=params.placements)
+        
+        # Copy values to original dtensor
+        params.copy_(resharded)
+        
+        return params
 
 class Attention(nn.Module):
     """

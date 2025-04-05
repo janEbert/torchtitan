@@ -109,6 +109,7 @@ class OptimizersContainer(Optimizer, Generic[T]):
     model_parts: List[nn.Module]
     norm_functions = {
         'spectral_norm': lambda x: torch.linalg.norm(x.data.to(torch.float32), ord=2, dtype=torch.float32),
+        'max_abs': lambda x: x.abs().max(),
         'l1_to_rms': lambda x: l1_to_rms_norm(x),
         'rms_to_l1': lambda x: rms_to_l1_norm(x),
     }
