@@ -8,8 +8,9 @@ __all__ = [
 
 class Scion(torch.optim.Optimizer):
 
-    def __init__(self, params, is_light=False, is_unconstrained=True, lr=0.02, momentum=0.95, nesterov=True, eps=1e-7, norm_factor='none',
-                 backend='newtonschulz5', backend_steps=5, world_mesh=None):
+    def __init__(self, params, is_light, is_unconstrained, 
+                 lr, momentum, nesterov, eps, norm_factor,
+                 backend, backend_steps, world_mesh):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, 
                         eps=eps, norm_factor=norm_factor, 
                         backend=backend, backend_steps=backend_steps)

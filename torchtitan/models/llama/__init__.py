@@ -33,35 +33,45 @@ llama3_configs = {
     "debugmodel": TransformerModelArgs(
         dim=256, n_layers=8, n_heads=16, rope_theta=500000
     ),
-    # 39M parameters
+    # 14M parameters
     "debugmodel-multiplier-1": TransformerModelArgs(
-        dim=256, n_layers=16, n_heads=4, n_kv_heads=None, ffn_dim_multiplier=4, multiple_of=256, 
-        rope_theta=500000, depth_init=False, qk_norm=True, norm_eps=1e-12, 
+        dim=256, n_layers=16, n_heads=4, n_kv_heads=None, ffn_dim_multiplier=1, multiple_of=256, 
+        rope_theta=500000, depth_init=False, qk_norm=True, norm_eps=1e-12, init_std=0
     ),
-    # 609M parameters
+    # 55M parameters
+    "debugmodel-multiplier-2": TransformerModelArgs(
+        dim=512, n_layers=16, n_heads=8, n_kv_heads=None, ffn_dim_multiplier=1, multiple_of=256, 
+        rope_theta=500000, depth_init=False, qk_norm=True, norm_eps=1e-12, init_std=0
+    ),
+    # 206M parameters
     "debugmodel-multiplier-4": TransformerModelArgs(
-        dim=1024, n_layers=16, n_heads=16, n_kv_heads=None, ffn_dim_multiplier=4, multiple_of=256, 
-        rope_theta=500000, depth_init=False, qk_norm=True, norm_eps=1e-12, 
+        dim=1024, n_layers=16, n_heads=16, n_kv_heads=None, ffn_dim_multiplier=1, multiple_of=256, 
+        rope_theta=500000, depth_init=False, qk_norm=True, norm_eps=1e-12, init_std=0
     ),
-    # 2.4B parameters
+    # 824M parameters
     "debugmodel-multiplier-8": TransformerModelArgs(
-        dim=2048, n_layers=16, n_heads=32, n_kv_heads=None, ffn_dim_multiplier=4, multiple_of=256, 
-        rope_theta=500000, depth_init=False, qk_norm=True, norm_eps=1e-12, 
+        dim=2048, n_layers=16, n_heads=32, n_kv_heads=None, ffn_dim_multiplier=1, multiple_of=256, 
+        rope_theta=500000, depth_init=False, qk_norm=True, norm_eps=1e-12, init_std=0
     ),
-    # 39M parameters
+    # 3.2B parameters
+    "debugmodel-multiplier-16": TransformerModelArgs(
+        dim=4096, n_layers=16, n_heads=64, n_kv_heads=None, ffn_dim_multiplier=1, multiple_of=256, 
+        rope_theta=500000, depth_init=False, qk_norm=True, norm_eps=1e-12, init_std=0
+    ),
+    # 1.9M parameters
     "debugmodel-2layers-multiplier-1": TransformerModelArgs(
-        dim=256, n_layers=2, n_heads=4, n_kv_heads=None, ffn_dim_multiplier=4, multiple_of=256, 
-        rope_theta=500000, depth_init=False, qk_norm=True, norm_eps=1e-12, 
+        dim=256, n_layers=2, n_heads=4, n_kv_heads=None, ffn_dim_multiplier=1, multiple_of=256, 
+        rope_theta=500000, depth_init=False, qk_norm=True, norm_eps=1e-12, init_std=0
     ),
     # 609M parameters
     "debugmodel-2layers-multiplier-4": TransformerModelArgs(
-        dim=1024, n_layers=2, n_heads=16, n_kv_heads=None, ffn_dim_multiplier=4, multiple_of=256, 
-        rope_theta=500000, depth_init=False, qk_norm=True, norm_eps=1e-12, 
+        dim=1024, n_layers=2, n_heads=16, n_kv_heads=None, ffn_dim_multiplier=1, multiple_of=256, 
+        rope_theta=500000, depth_init=False, qk_norm=True, norm_eps=1e-12, init_std=0
     ),
     # 2.4B parameters
     "debugmodel-2layers-multiplier-8": TransformerModelArgs(
-        dim=2048, n_layers=2, n_heads=32, n_kv_heads=None, ffn_dim_multiplier=4, multiple_of=256, 
-        rope_theta=500000, depth_init=False, qk_norm=True, norm_eps=1e-12, 
+        dim=2048, n_layers=2, n_heads=32, n_kv_heads=None, ffn_dim_multiplier=1, multiple_of=256, 
+        rope_theta=500000, depth_init=False, qk_norm=True, norm_eps=1e-12, init_std=0
     ),
     "8B": TransformerModelArgs(
         dim=4096,
