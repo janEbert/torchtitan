@@ -442,12 +442,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if hasattr(model, "update_gate_bias"):
                 model.update_gate_bias()
 
-        grad_norm = dist_utils.clip_grad_norm_(
-            [p for m in model_parts for p in m.parameters()],
-            self.job_config.training.max_norm,
-            foreach=True,
-            pp_mesh=self.world_mesh["pp"] if parallel_dims.pp_enabled else None,
-        )
+        grad_norm = None
+        if self.job_config.training.max_norm > 0:
+            grad_norm = dist_utils.clip_grad_norm_(
+                [p for m in model_parts for p in m.parameters()],
+                self.job_config.training.max_norm,
+                foreach=True,
+                pp_mesh=self.world_mesh["pp"] if parallel_dims.pp_enabled else None,
+            )
         self.checkpointer.maybe_wait_for_staging()
         self.optimizers.step()
         self.lr_schedulers.step()
@@ -493,9 +495,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         else:
             global_avg_loss = global_max_loss = loss.item()
 
-        extra_log_data = {
-            "optim/grad_norm": grad_norm,
-        }
+        extra_log_data = {"optim/grad_norm": grad_norm} if grad_norm is not None else {}
         extra_log_data.update(self.optimizers.get_lrs())
         if (self.step == 1 or self.step % self.job_config.metrics.log_norm_freq == 0):
             param_norms = self.optimizers.get_parameter_norms()
@@ -508,10 +508,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 extra_log_data[f"loss_metrics/moe_entropy_per_layer_{k}"] = v
 
         color = self.metrics_processor.color
-        extra_print_data = (
-            f"  {color.green}gradnorm: {grad_norm:7.4f}{color.reset}"
-        )
-
+        if grad_norm is not None:
+            extra_print_data = (
+                f"  {color.green}gradnorm: {grad_norm:7.4f}{color.reset}"
+            )
+        else:
+            extra_print_data = ("")
         self.metrics_processor.log(
             self.step, global_avg_loss, global_max_loss, extra_log_data, extra_print_data,
         )
