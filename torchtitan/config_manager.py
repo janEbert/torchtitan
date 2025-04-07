@@ -263,6 +263,36 @@ class JobConfig:
             "--optimizer.weight_decay", type=float, default=0.1, help="Weight decay value to use"
         )
         self.parser.add_argument(
+            "--optimizer.backend_steps",
+            type=int,
+            default=5,
+            help="Number of steps for the Muon backend",
+        )
+        self.parser.add_argument(
+            "--optimizer.momentum", type=float, default=0.95, help="Muon momentum to use",
+        )
+        self.parser.add_argument(
+            "--optimizer.nesterov",
+            action="store_true",
+            help="Whether to use Nesterov momentum in Muon",
+        )
+        self.parser.add_argument(
+            "--optimizer.embed_lr", type=float, help="Embedding layer learning rate"
+        )
+        self.parser.add_argument(
+            "--optimizer.unembed_lr", type=float, help="Unembedding layer learning rate"
+        )
+        self.parser.add_argument(
+            "--optimizer.embed_str_match",
+            type=str,
+            help="String to match for embedding layer parameter group",
+        )
+        self.parser.add_argument(
+            "--optimizer.unembed_str_match",
+            type=str,
+            help="String to match for unembedding layer parameter group",
+        )
+        self.parser.add_argument(
             "--optimizer.implementation",
             type=str,
             default="fused",
