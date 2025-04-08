@@ -31,5 +31,7 @@ def build_norm(norm_type: str, dim: int, eps: float = 1e-6):
         return nn.LayerNorm(dim, eps=eps, elementwise_affine=False, bias=False)
     elif norm_type == "rmsnorm":
         return nn.RMSNorm(dim, eps=eps)
+    elif norm_type == "np_rmsnorm":
+        return nn.RMSNorm(dim, eps=eps, elementwise_affine=False)
     else:
         raise NotImplementedError(f"Unknown norm_type: '{norm_type}'")
