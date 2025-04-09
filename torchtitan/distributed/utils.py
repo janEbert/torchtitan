@@ -174,7 +174,7 @@ def get_train_context(
     return context
 
 
-def init_distributed(job_config):
+def init_distributed(job_config, device: Optional[torch.device] = None):
     def _warn_overwrite_env(env, val):
         if env in os.environ:
             logger.warning(
@@ -221,6 +221,7 @@ def init_distributed(job_config):
     torch.distributed.init_process_group(
         backend=_get_distributed_backend(job_config),
         timeout=timedelta(seconds=job_config.comm.init_timeout_seconds),
+        device_id=device,
     )
 
 
