@@ -4,8 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections import OrderedDict
 import functools
-from typing import Any, Dict, Generic, List, TypeVar
+import re
+from typing import Any, Dict, Generic, List, Optional, TypeVar
 
 import torch
 import torch.nn as nn
@@ -32,6 +34,43 @@ if has_torchft:
 
 
 T = TypeVar("T", bound=Optimizer)
+
+
+def _extract_param_groups(
+    model: torch.nn.Module,
+    optimizer_config: Optional[dict[str, Any]] = None,
+):
+    param_groups_config: Optional[list[dict[str, Any]]] = (
+        optimizer_config.pop("param_groups", None)
+        if optimizer_config is not None
+        else None
+    )
+
+    if optimizer_config is None or not param_groups_config:
+        params = [p for p in model.parameters() if p.requires_grad]
+    else:
+        params = []
+        param_dict = OrderedDict((n, p) for n, p in model.named_parameters() if p.requires_grad)
+
+        for param_group_config in param_groups_config:
+            str_match = param_group_config.pop("param_str_match")
+            filter_fn = functools.partial(re.search, str_match)
+            param_names = [n for n in param_dict.keys() if filter_fn(n)]
+            group_params = {
+                "params": [param_dict.pop(n) for n in param_names],
+                "param_names": param_names,
+            }
+            assert len(group_params["params"]) == len(group_params["param_names"])
+            group_params.update(param_group_config)
+            params.append(group_params)
+
+        param_names = list(param_dict.keys())
+        params.insert(
+            0,
+            {"params": [param_dict.pop(n) for n in param_names], "param_names": param_names},
+        )
+        assert not param_dict
+    return params
 
 
 class OptimizersContainer(Optimizer, Generic[T]):
@@ -72,22 +111,34 @@ class OptimizersContainer(Optimizer, Generic[T]):
         all_params = []
         self.optimizers: List[T] = []
         self.model_parts = model_parts
+        param_groups_config = optimizer_kwargs.get("param_groups", None)
         for model in self.model_parts:
-            params = [p for p in model.parameters() if p.requires_grad]
+            # copy parts we will pop from to preserve settings across model parts
+            kwargs = optimizer_kwargs.copy()
+            if "param_groups" in optimizer_kwargs:
+                kwargs["param_groups"] = (
+                    param_groups_config.copy()
+                    if param_groups_config is not None
+                    else None
+                )
 
             # for muon, we need to pass model as well
 
             is_muon = issubclass(optimizer_cls, (Muon, DistributedMuon, DistributedMuonV2))
-            extra_kwargs = optimizer_kwargs.pop("extra_kwargs")
+            extra_kwargs = kwargs.pop("extra_kwargs")
 
+            params = _extract_param_groups(model, kwargs)
             if is_muon:
-                optimizer_kwargs.update(extra_kwargs)
-                self.optimizers.append(optimizer_cls(params, model, **optimizer_kwargs))
+                kwargs.update(extra_kwargs)
+                self.optimizers.append(optimizer_cls(params, model, **kwargs))
             else:
-                self.optimizers.append(optimizer_cls(params, **optimizer_kwargs))
-
+                self.optimizers.append(optimizer_cls(params, **kwargs))
             all_params.extend(params)
         self._validate_length(len(self.model_parts))
+        # Do not separately save the external settings in
+        # optimizer defaults.
+        del optimizer_kwargs["param_groups"]
+        optimizer_kwargs.update(optimizer_kwargs.pop("extra_kwargs", {}))
         self._post_init(all_params, optimizer_kwargs)
 
     def __iter__(self) -> Optimizer:
@@ -283,20 +334,59 @@ def build_optimizers(
     eps = job_config.optimizer.eps
     weight_decay = job_config.optimizer.weight_decay
 
-    optim_implementation = job_config.optimizer.implementation
-    assert optim_implementation in ["fused", "foreach", "for-loop"]
+    if name in ["Adam", "AdamW"]:
+        optim_implementation = job_config.optimizer.implementation
+        assert optim_implementation in ["fused", "foreach", "for-loop"]
 
-    fused = optim_implementation == "fused"
-    foreach = optim_implementation == "foreach"
+        fused = optim_implementation == "fused"
+        foreach = optim_implementation == "foreach"
 
-    optimizer_kwargs = {
-        "lr": lr,
-        "eps": eps,
-        "betas": (0.9, 0.95),
-        "weight_decay": weight_decay,
-        "fused": fused,
-        "foreach": foreach,
-    }
+        optimizer_kwargs = {
+            "lr": lr,
+            "eps": eps,
+            "betas": (0.9, 0.95),
+            "weight_decay": weight_decay,
+            "fused": fused,
+            "foreach": foreach,
+        }
+    elif name in ["Muon", "DistributedMuon", "DistributedMuonV2"]:
+        backend_steps = job_config.optimizer.backend_steps
+        momentum = job_config.optimizer.momentum
+        nesterov = job_config.optimizer.nesterov
+
+        optimizer_kwargs = {
+            "lr": lr,
+            "momentum": momentum,
+            "nesterov": nesterov,
+            "eps": eps,
+            "norm_factor": "spectral",
+            "backend": "newtonschulz5",
+            "backend_steps": backend_steps,
+        }
+    else:
+        raise NotImplementedError(f"Optimizer {name} not added.")
+
+    # Configure parameter group settings
+    embed_lr = job_config.optimizer.embed_lr
+    embed_str_match = job_config.optimizer.embed_str_match
+    if embed_lr is not None and embed_str_match:
+        param_groups_config = optimizer_kwargs.setdefault("param_groups", [])
+        param_groups_config.append({
+            "param_str_match": embed_str_match,
+            "lr": embed_lr,
+            "norm_factor": "embed_linear",
+            "backend": "identity",
+        })
+    unembed_lr = job_config.optimizer.unembed_lr
+    unembed_str_match = job_config.optimizer.unembed_str_match
+    if unembed_lr is not None and unembed_str_match:
+        param_groups_config = optimizer_kwargs.setdefault("param_groups", [])
+        param_groups_config.append({
+            "param_str_match": unembed_str_match,
+            "lr": unembed_lr,
+            "norm_factor": "unembed_linear",
+            "backend": "identity",
+        })
 
     optimizer_kwargs["extra_kwargs"] = extra_kwargs
 
