@@ -274,15 +274,15 @@ class JobConfig:
             "--optimizer.backend_steps",
             type=int,
             default=5,
-            help="Number of steps for the Muon backend",
+            help="Number of steps for the Scion backend",
         )
         self.parser.add_argument(
-            "--optimizer.momentum", type=float, default=0.95, help="Muon momentum to use",
+            "--optimizer.momentum", type=float, default=0.95, help="Scion momentum to use",
         )
         self.parser.add_argument(
             "--optimizer.nesterov",
             action="store_true",
-            help="Whether to use Nesterov momentum in Muon",
+            help="Whether to use Nesterov momentum in Scion",
         )
         self.parser.add_argument(
             "--optimizer.embed_lr", type=float, help="Embedding layer learning rate"
