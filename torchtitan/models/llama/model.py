@@ -577,7 +577,7 @@ class MTPModule(nn.Module):
 
     def init_weights(self):
         self.in_norm.reset_parameters()
-        init_fn = build_init_fn(self.init_fn_type)
+        init_fn = build_init_fn(self.parent_transformer.model_args.intermediate_init_fn_type)
         # Re-use block's init std.
         init_fn(self.mtp_proj.weight, mean=0.0, std=self.block.weight_init_std)
         self.block.init_weights()
@@ -715,7 +715,7 @@ class Transformer(nn.Module, ModelProtocol):
         cutoff_factor = 3
         if self.output is not None:
             extra_kwargs = {}
-            if self.init_fn_type == "trunc_normal":
+            if self.model_args.final_out_init_fn_type == "trunc_normal":
                 extra_kwargs["a"] = -cutoff_factor * final_out_std
                 extra_kwargs["b"] = cutoff_factor * final_out_std
             final_out_init_fn(
