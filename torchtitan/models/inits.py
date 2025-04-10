@@ -18,31 +18,32 @@ def _wrap_ignore_mean_std(fn):
     return wrapped_fn
 
 
-def orthogonal_(parameters, gain: float = 1.0, generator: Optional[torch.Generator] = None):
-    assert generator is not None, "distributed orthogonal init needs an RNG seed"
-    # Force all ranks to use same RNG.
-    rng_state = generator.get_state()
-    torch.distributed.broadcast(rng_state, group_src=0)
-    generator.set_state(rng_state)
-
-    if isinstance(parameters, nn.Parameter):
-        tensor = parameters.data
+def orthogonal_(params, gain: float = 1.0, generator: Optional[torch.Generator] = None):
+    if not isinstance(params.data, DTensor):
+        return nn.init.orthogonal_(params, gain=gain, generator=generator)
     else:
-        tensor = parameters
+        assert generator is not None, "distributed orthogonal init needs an RNG seed"
+        # Force all ranks to use same RNG.
+        rng_state = generator.get_state()
+        torch.distributed.broadcast(rng_state, group_src=0)
+        generator.set_state(rng_state)
 
-    if not isinstance(tensor, DTensor):
-        return nn.init.orthogonal_(tensor, gain=gain, generator=generator)
+        temp_tensor = torch.empty(params.shape)  # full shape
+        torch.nn.init.orthogonal_(temp_tensor, gain=gain, generator=generator)
 
-    buffer = torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
-    nn.init.orthogonal_(buffer, gain=gain, generator=generator)
+        # Create a replicated DTensor
+        replicated = DTensor.from_local(
+            temp_tensor,
+            placements=[Replicate()] * params.device_mesh.ndim,
+            device_mesh=params.device_mesh,
+        )
 
-    buffer = DTensor.from_local(
-        buffer,
-        placements=[Replicate()] * tensor.device_mesh.ndim,
-        device_mesh=tensor.device_mesh,
-    ).redistribute(placements=tensor.placements)
+        # Reshard to match original dtensor's placement
+        resharded = replicated.redistribute(placements=params.placements)
 
-    tensor.data = buffer
+        # Copy values to original dtensor
+        params.copy_(resharded)
+        return params
 
 
 def scion_normal_(
