@@ -51,6 +51,7 @@ embed_lr = 3e-4
 unembed_lr = 3e-4
 embed_str_match = "tok_embeddings.weight"
 unembed_str_match = "output.weight"
+implementation = "fused" # for AdamW
 
 [lr_scheduler]
 warmup_steps = 200  # lr scheduler warm up, normally 20% of the train steps
