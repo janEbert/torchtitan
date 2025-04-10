@@ -114,7 +114,7 @@ class Muon(torch.optim.Optimizer):
     def _compute_grad(self, p, momentum, nesterov, eps, norm_factor, zeropower_backend, backend_steps):
         g = p.grad
         if g is None or not p.requires_grad:
-            return
+            return None
 
         # State initialization
         state = self.state[p]
