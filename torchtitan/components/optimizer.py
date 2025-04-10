@@ -217,7 +217,10 @@ class OptimizersContainer(Optimizer, Generic[T]):
                         "backend_steps": group["backend_steps"]
                     }
                 else:
-                    warnings.warn(f"Optimizer {optimizer.__class__.__name__} does not support norm computation.")
+                    warnings.warn(
+                        f"Optimizer {optimizer.__class__.__name__} does not support "
+                        f"norm computation."
+                    )
                     continue
 
                 for n, p in zip(group["param_names"], group["params"]):
