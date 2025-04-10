@@ -46,6 +46,9 @@ unembed_str_match = "output.weight"
 
 [lr_scheduler]
 warmup_steps = 200  # lr scheduler warm up, normally 20% of the train steps
+decay_ratio = 0.25
+decay_type = "linear"  # linear / cosine / sqrt
+lr_min = 0.0
 
 [training]
 seed = 1
