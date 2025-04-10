@@ -577,8 +577,9 @@ class MTPModule(nn.Module):
 
     def init_weights(self):
         self.in_norm.reset_parameters()
+        init_fn = build_init_fn(self.init_fn_type)
         # Re-use block's init std.
-        self.mtp_proj.init_weights(self.block.weight_init_std)
+        init_fn(self.mtp_proj.weight, mean=0.0, std=self.block.weight_init_std)
         self.block.init_weights()
 
     def forward(self, tokens: torch.Tensor, prev_embed: torch.Tensor):
