@@ -264,6 +264,8 @@ class OptimizersContainer(Optimizer, Generic[T]):
                         p = p.to_local() if isinstance(p, DTensor) else p
                         g = g.to_local() if isinstance(g, DTensor) else g
                         update = -group["lr"] * g
+                        if "tok_embeddings" in n:
+                            p, update = p.T, update.T
                         for norm_name, norm_func in NORM_FUNCTIONS.items():
                             norms[f"model_part_{i}/{n}/param/{norm_name}"] = norm_func(p)
                             norms[f"model_part_{i}/{n}/update/{norm_name}"] = norm_func(update)
