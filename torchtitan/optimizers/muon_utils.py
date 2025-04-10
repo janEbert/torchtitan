@@ -1,5 +1,6 @@
+from typing import cast, List, Tuple
+
 import torch
-from typing import List, Tuple, cast
 from torch import Tensor
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
