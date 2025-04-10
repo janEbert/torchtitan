@@ -1,6 +1,8 @@
 import torch
 from typing import List, Tuple, cast
 from torch import Tensor
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.optim.optimizer import (
     _device_dtype_check_for_fused,
     _get_scalar_dtype,
@@ -182,3 +184,18 @@ def update_adamw(self):
             found_inf=getattr(self, "found_inf", None),
             has_complex=has_complex,
         )
+
+
+def gather_full_grad(g):
+    """Gathers the full gradient across all distributed processes using DTensor."""
+    assert isinstance(g, DTensor), "Expected gradient to be a DTensor"
+    replicated_grad = g.redistribute(
+        placements=[Replicate()] * g.device_mesh.ndim
+    )  # make sure all rank has the same shape
+    return replicated_grad
+
+
+def shard_full_grad(g):
+    """Extracts the correct shard for the current rank from a replicated DTensor."""
+    assert isinstance(g, DTensor), "Expected gradient to be a DTensor"
+    return g.redistribute(placements=[Shard(0)])

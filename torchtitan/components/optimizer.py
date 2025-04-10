@@ -25,7 +25,7 @@ from torch.optim import Optimizer
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config_manager import JobConfig
 from torchtitan.optimizers import DistributedMuon, DistributedMuonV2, Muon, Scion
-from torchtitan.optimizers.scion import zeropower_backends
+from torchtitan.optimizers.muon_utils import gather_full_grad, zeropower_backends
 
 __all__ = [
     "OptimizersContainer",
@@ -226,6 +226,8 @@ class OptimizersContainer(Optimizer, Generic[T]):
                 buf = state["momentum_buffer"]
                 buf = buf.mul(1-momentum).add(g, alpha=momentum)
                 g = buf if not nesterov else buf.mul(1-momentum).add(g, alpha=momentum)
+            if optimizer.fsdp_enabled:
+                g = gather_full_grad(g)
 
             return optimizer.lmo(g, **kwargs)
         elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
