@@ -22,6 +22,7 @@ from torch.optim import Optimizer
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config_manager import JobConfig
 from torchtitan.optimizers import DistributedMuon, DistributedMuonV2, Muon, Scion
+from torchtitan.optimizers.scion import zeropower_backends
 
 __all__ = [
     "OptimizersContainer",
@@ -214,8 +215,7 @@ class OptimizersContainer(Optimizer, Generic[T]):
                         "nesterov": group["nesterov"],
                         "eps": group["eps"],
                         "norm_factor": group["norm_factor"],
-                        # TODO uncomment once `zeropower_backends` exist
-                        # "zeropower_backend": zeropower_backends[group["backend"]],
+                        "zeropower_backend": zeropower_backends[group["backend"]],
                         "backend_steps": group["backend_steps"]
                     }
                 else:
