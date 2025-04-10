@@ -429,15 +429,13 @@ class GroupedExperts(nn.Module):
             if init_gate_as_residual
             else init_std
         )
-        # TODO Fix initialization; not everything should be initialized
-        #      as residual.
         if self.num_experts > 1:
-            init_fn(self.gate_proj, mean=0.0, std=init_std / residual_div)
+            init_fn(self.gate_proj, mean=0.0, std=init_std)
             init_fn(self.down_proj, mean=0.0, std=init_std / residual_div)
             if self.up_proj is not None:
                 init_fn(self.up_proj, mean=0.0, std=gate_init_std)
         else:
-            init_fn(self.gate_proj.weight, mean=0.0, std=init_std / residual_div)
+            init_fn(self.gate_proj.weight, mean=0.0, std=init_std)
             init_fn(self.down_proj.weight, mean=0.0, std=init_std / residual_div)
             if self.up_proj is not None:
                 init_fn(self.up_proj.weight, mean=0.0, std=gate_init_std)
