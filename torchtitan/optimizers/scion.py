@@ -43,7 +43,8 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
 
     for _ in range(steps):
         A = X @ X.T
-        B = b * A + c * A @ A  # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        B = b * A + c * A @ A
         X = a * X + B @ X
 
     if G.size(0) > G.size(1):
@@ -125,7 +126,16 @@ class Scion(torch.optim.Optimizer):
         return loss
 
     @torch.no_grad()
-    def _compute_grad(self, p, momentum, nesterov, eps, norm_factor, zeropower_backend, backend_steps):
+    def _compute_grad(
+            self,
+            p,
+            momentum,
+            nesterov,
+            eps,
+            norm_factor,
+            zeropower_backend,
+            backend_steps,
+    ):
         g = p.grad
         if g is None or not p.requires_grad:
             return None
@@ -153,7 +163,7 @@ class Scion(torch.optim.Optimizer):
             # print('\n\n\n')
             # print('EMBED, shape: ', g.shape)
             # print('\n\n\n')
-            ### NB: here assume shape [vocab_size, embed_dim]
+            # NB: here assume shape [vocab_size, embed_dim]
             g *= torch.rsqrt(g.pow(2).mean(1, keepdim=True) + eps)
             if norm_factor == 'embed_linear':
                 g *= g.size(1)
