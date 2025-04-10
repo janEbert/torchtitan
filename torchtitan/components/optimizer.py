@@ -261,7 +261,9 @@ class OptimizersContainer(Optimizer, Generic[T]):
                 for n, p in zip(group["param_names"], group["params"]):
                     g = self.compute_grad(p, optimizer, **param_kwargs)
                     if g is not None:
-                        update = -g * group["lr"]
+                        p = p.to_local() if isinstance(p, DTensor) else p
+                        g = g.to_local() if isinstance(g, DTensor) else g
+                        update = -group["lr"] * g
                         for norm_name, norm_func in NORM_FUNCTIONS.items():
                             norms[f"model_part_{i}/{n}/param/{norm_name}"] = norm_func(p)
                             norms[f"model_part_{i}/{n}/update/{norm_name}"] = norm_func(update)
