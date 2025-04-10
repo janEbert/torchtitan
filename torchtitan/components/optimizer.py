@@ -6,6 +6,7 @@
 
 from collections import OrderedDict
 import functools
+import math
 import re
 from typing import Any, Dict, Generic, List, Optional, TypeVar
 import warnings
@@ -17,6 +18,8 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
     StateDictOptions,
 )
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Replicate
 from torch.optim import Optimizer
 
 from torchtitan.components.ft import FTManager, has_torchft
@@ -201,6 +204,32 @@ class OptimizersContainer(Optimizer, Generic[T]):
         )
         list(map(func, self.model_parts, self.optimizers))
 
+    @staticmethod
+    def compute_grad(p, optimizer=None, **kwargs):
+        if isinstance(optimizer, Scion):
+            return optimizer._compute_grad(p, **kwargs)
+        elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+            eps = kwargs["eps"]
+            weight_decay = kwargs["weight_decay"]
+            beta1, beta2 = kwargs["betas"]
+            assert weight_decay == 0.0, "Weight decay not supported for grad computation."
+
+            param_optim_state = optimizer.state[p]
+            step = param_optim_state["step"].item()
+            bias_correction1 = 1 - beta1**step
+            bias_correction2 = 1 - beta2**step
+            denom = (param_optim_state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2)) + eps
+            step_size = 1 / bias_correction1
+            g = step_size * param_optim_state["exp_avg"].div(denom)
+
+            assert isinstance(g, DTensor), "Expected gradient to be a DTensor"
+            return g.redistribute(placements=[Replicate()] * g.device_mesh.ndim)
+        else:
+            raise TypeError(
+                f"Optimizer {optimizer.__class__.__name__} does not support "
+                f"gradient computation."
+            )
+
     def get_parameter_norms(self):
         norms = {}
         for i, _ in enumerate(self.model_parts):
@@ -216,6 +245,12 @@ class OptimizersContainer(Optimizer, Generic[T]):
                         "zeropower_backend": zeropower_backends[group["backend"]],
                         "backend_steps": group["backend_steps"]
                     }
+                elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+                    param_kwargs = {
+                        'eps': group['eps'],
+                        'betas': group['betas'],
+                        'weight_decay': group['weight_decay']
+                    }
                 else:
                     warnings.warn(
                         f"Optimizer {optimizer.__class__.__name__} does not support "
@@ -224,7 +259,7 @@ class OptimizersContainer(Optimizer, Generic[T]):
                     continue
 
                 for n, p in zip(group["param_names"], group["params"]):
-                    g = optimizer._compute_grad(p, **param_kwargs)
+                    g = self.compute_grad(p, optimizer, **param_kwargs)
                     if g is not None:
                         update = -g * group["lr"]
                         for norm_name, norm_func in NORM_FUNCTIONS.items():
