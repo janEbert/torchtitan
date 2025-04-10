@@ -575,8 +575,6 @@ class MTPModule(nn.Module):
         self.mtp_proj = nn.Linear(2 * model_args.dim, model_args.dim)
         self.block = parent_transformer.transformer_block_cls(layer_id, model_args)
 
-        self.init_weights()
-
     def init_weights(self):
         self.in_norm.reset_parameters()
         # Re-use block's init std.
