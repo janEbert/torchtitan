@@ -479,7 +479,7 @@ def build_optimizers(
             "lr": embed_lr,
         }
         if name == "Scion":
-            param_group_config["norm_factor"] = "embed_linear"
+            param_group_config["norm_factor"] = "embed_sqrt"
             param_group_config["backend"] = "identity"
         param_groups_config.append(param_group_config)
     unembed_lr = job_config.optimizer.unembed_lr
@@ -491,7 +491,7 @@ def build_optimizers(
             "lr": unembed_lr / width_multiplier,
         }
         if name == "Scion":
-            param_group_config["norm_factor"] = "unembed_linear"
+            param_group_config["norm_factor"] = "unembed_sqrt"
             param_group_config["backend"] = "identity"
         param_groups_config.append(param_group_config)
 
