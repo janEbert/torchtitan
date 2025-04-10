@@ -40,7 +40,7 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     X = G.bfloat16()
     if G.size(0) > G.size(1):
         X = X.T
-    X /= (torch.linalg.norm(X) + eps)  # ensure top singular value <= 1
+    X = X / (torch.linalg.norm(X) + eps)  # ensure top singular value <= 1
 
     for _ in range(steps):
         A = X @ X.T
@@ -145,9 +145,9 @@ class Scion(torch.optim.Optimizer):
 
         # Compute updated gradient
         buf = state['momentum_buffer']
-        buf.mul_(momentum).add_(g)
+        buf = momentum * buf + g
         if nesterov:
-            g = g.add(buf, alpha=momentum)
+            g = g + momentum * buf
 
         # Transform gradient with the backend function
         g = self.gather_full_grad(g)
@@ -158,28 +158,28 @@ class Scion(torch.optim.Optimizer):
             # print('\n\n\n')
             # print('LINEAR, shape: ', g.shape)
             # print('\n\n\n')
-            g *= (g.size(0)/g.size(1))**0.5
+            g = g * (g.size(0)/g.size(1))**0.5
         elif norm_factor.startswith('embed'):
             # print('\n\n\n')
             # print('EMBED, shape: ', g.shape)
             # print('\n\n\n')
             # NB: here assume shape [vocab_size, embed_dim]
-            g *= torch.rsqrt(g.pow(2).mean(1, keepdim=True) + eps)
+            g = g * torch.rsqrt(g.pow(2).mean(1, keepdim=True) + eps)
             if norm_factor == 'embed_linear':
-                g *= g.size(1)
+                g = g * g.size(1)
             elif norm_factor == 'embed_sqrt':
-                g *= g.size(1)**0.5
+                g = g * g.size(1)**0.5
             else:
                 raise ValueError(f"Unknown norm_factor: {norm_factor}")
         elif norm_factor.startswith('unembed'):
             # print('\n\n\n')
             # print('UNEMBED, shape: ', g.shape)
             # print('\n\n\n')
-            g *= torch.rsqrt(g.pow(2).mean(1, keepdim=True) + eps)
+            g = g * torch.rsqrt(g.pow(2).mean(1, keepdim=True) + eps)
             if norm_factor == 'unembed_linear':
-                g /= g.size(1)
+                g = g / g.size(1)
             elif norm_factor == 'unembed_sqrt':
-                g /= g.size(1)**0.5
+                g = g / g.size(1)**0.5
             else:
                 raise ValueError(f"Unknown norm_factor: {norm_factor}")
         elif norm_factor == 'none':
