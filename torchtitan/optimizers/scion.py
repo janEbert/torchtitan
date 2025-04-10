@@ -145,9 +145,11 @@ class Scion(torch.optim.Optimizer):
 
         # Compute updated gradient
         buf = state['momentum_buffer']
-        buf = momentum * buf + g
+        buf = g + momentum * buf
         if nesterov:
             g = g + momentum * buf
+        else:
+            g = buf
 
         # Transform gradient with the backend function
         g = self.gather_full_grad(g)
