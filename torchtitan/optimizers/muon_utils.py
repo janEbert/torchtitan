@@ -24,7 +24,7 @@ def zeropower_via_newtonschulz5(G, steps):
     if G.size(0) > G.size(1):
         X = X.T
     # Ensure spectral norm is at most 1
-    X = X / (X.norm() + 1e-7)
+    X = X / (torch.linalg.norm(X) + 1e-7)
     # Perform the NS iterations
     for _ in range(steps):
         A = X @ X.T
