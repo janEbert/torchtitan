@@ -35,7 +35,7 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     #     (2.8366, -3.0525, 1.2012),
     # ]:
     X = G.bfloat16()
-    X /= (X.norm() + eps)  # ensure top singular value <= 1
+    X /= (torch.linalg.norm(X) + eps)  # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
 
