@@ -36,6 +36,34 @@ if has_torchft:
 T = TypeVar("T", bound=Optimizer)
 
 
+@torch.no_grad()
+def spectral_norm(x):
+    return torch.linalg.norm(x.to(torch.float32), ord=2, dtype=torch.float32)
+
+
+@torch.no_grad()
+def l1_to_rms_norm(W):
+    norm = torch.max(torch.linalg.norm(W.to(torch.float32), ord=2, dim=0, dtype=torch.float32))
+    scale = torch.sqrt(torch.tensor(W.shape[0], dtype=W.dtype, device=W.device))
+    norm /= scale
+    return norm
+
+
+@torch.no_grad()
+def rms_to_l1_norm(W):
+    norm = torch.max(torch.linalg.norm(W.to(torch.float32), ord=2, dim=1, dtype=torch.float32))
+    scale = torch.sqrt(torch.tensor(W.shape[1], dtype=W.dtype, device=W.device))
+    norm *= scale
+    return norm
+
+
+NORM_FUNCTIONS = {
+    "spectral": spectral_norm,
+    "l1_to_rms": l1_to_rms_norm,
+    "rms_to_l1": rms_to_l1_norm,
+}
+
+
 def _extract_param_groups(
     model: torch.nn.Module,
     optimizer_config: Optional[dict[str, Any]] = None,
@@ -173,6 +201,29 @@ class OptimizersContainer(Optimizer, Generic[T]):
             options=StateDictOptions(flatten_optimizer_state_dict=True),
         )
         list(map(func, self.model_parts, self.optimizers))
+
+    def get_muon_parameter_norms(self):
+        norms = {}
+        for i, _ in enumerate(self.model_parts):
+            # NB: assumes correspondences between model parts and optimizers
+            for group in self.optimizers[i].param_groups:
+                param_kwargs = {
+                    "momentum": group["momentum"],
+                    "nesterov": group["nesterov"],
+                    "eps": group["eps"],
+                    "norm_factor": group["norm_factor"],
+                    # TODO uncomment once `zeropower_backends` exist
+                    # "zeropower_backend": zeropower_backends[group["backend"]],
+                    "backend_steps": group["backend_steps"]
+                }
+                for n, p in zip(group["param_names"], group["params"]):
+                    g = self.optimizers[i]._compute_grad(p, **param_kwargs)
+                    if g is not None:
+                        update = -g * group["lr"]
+                        for norm_name, norm_func in NORM_FUNCTIONS.items():
+                            norms[f"model_part_{i}/{n}/param/{norm_name}"] = norm_func(p)
+                            norms[f"model_part_{i}/{n}/update/{norm_name}"] = norm_func(update)
+        return norms
 
     def _validate_length(self, expected_length: int) -> None:
         assert expected_length == len(self.optimizers), (
