@@ -8,6 +8,7 @@ from collections import OrderedDict
 import functools
 import re
 from typing import Any, Dict, Generic, List, Optional, TypeVar
+import warnings
 
 import torch
 import torch.nn as nn
@@ -202,22 +203,28 @@ class OptimizersContainer(Optimizer, Generic[T]):
         )
         list(map(func, self.model_parts, self.optimizers))
 
-    def get_muon_parameter_norms(self):
+    def get_parameter_norms(self):
         norms = {}
         for i, _ in enumerate(self.model_parts):
             # NB: assumes correspondences between model parts and optimizers
-            for group in self.optimizers[i].param_groups:
-                param_kwargs = {
-                    "momentum": group["momentum"],
-                    "nesterov": group["nesterov"],
-                    "eps": group["eps"],
-                    "norm_factor": group["norm_factor"],
-                    # TODO uncomment once `zeropower_backends` exist
-                    # "zeropower_backend": zeropower_backends[group["backend"]],
-                    "backend_steps": group["backend_steps"]
-                }
+            optimizer = self.optimizers[i]
+            for group in optimizer.param_groups:
+                if isinstance(optimizer, (Muon, DistributedMuon, DistributedMuonV2)):
+                    param_kwargs = {
+                        "momentum": group["momentum"],
+                        "nesterov": group["nesterov"],
+                        "eps": group["eps"],
+                        "norm_factor": group["norm_factor"],
+                        # TODO uncomment once `zeropower_backends` exist
+                        # "zeropower_backend": zeropower_backends[group["backend"]],
+                        "backend_steps": group["backend_steps"]
+                    }
+                else:
+                    warnings.warn(f"Optimizer {optimizer.__class__.__name__} does not support norm computation.")
+                    continue
+
                 for n, p in zip(group["param_names"], group["params"]):
-                    g = self.optimizers[i]._compute_grad(p, **param_kwargs)
+                    g = optimizer._compute_grad(p, **param_kwargs)
                     if g is not None:
                         update = -g * group["lr"]
                         for norm_name, norm_func in NORM_FUNCTIONS.items():
