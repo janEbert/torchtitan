@@ -46,6 +46,11 @@ def spectral_norm(x):
 
 
 @torch.no_grad()
+def supremum_norm(x):
+    return x.abs().max()
+
+
+@torch.no_grad()
 def l1_to_rms_norm(W):
     norm = torch.max(torch.linalg.norm(W.to(torch.float32), ord=2, dim=0, dtype=torch.float32))
     scale = torch.sqrt(torch.tensor(W.shape[0], dtype=W.dtype, device=W.device))
@@ -63,6 +68,7 @@ def rms_to_l1_norm(W):
 
 NORM_FUNCTIONS = {
     "spectral": spectral_norm,
+    "supremum": supremum_norm,
     "l1_to_rms": l1_to_rms_norm,
     "rms_to_l1": rms_to_l1_norm,
 }
