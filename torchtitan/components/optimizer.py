@@ -250,12 +250,19 @@ class OptimizersContainer(Optimizer, Generic[T]):
             assert weight_decay == 0.0, "Weight decay not supported for grad computation."
 
             param_optim_state = optimizer.state[p]
-            step = param_optim_state["step"].item()
-            bias_correction1 = 1 - beta1**step
-            bias_correction2 = 1 - beta2**step
-            denom = (param_optim_state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2)) + eps
-            step_size = 1 / bias_correction1
-            g = step_size * param_optim_state["exp_avg"].div(denom)
+            if "step" not in param_optim_state:
+                step = 0
+            else:
+                step = param_optim_state["step"].item()
+            if "exp_avg_sq" in param_optim_state and "exp_avg" in param_optim_state:
+                bias_correction1 = 1 - beta1**step
+                bias_correction2 = 1 - beta2**step
+                denom = (param_optim_state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2)) + eps
+                step_size = 1 / bias_correction1
+                g = step_size * param_optim_state["exp_avg"].div(denom)
+            else:
+                # TODO(JSC): if we shard the MoE model, we need to remove the following code
+                g = p.grad
 
             assert isinstance(g, DTensor), "Expected gradient to be a DTensor"
             return g.redistribute(placements=[Replicate()] * g.device_mesh.ndim)
