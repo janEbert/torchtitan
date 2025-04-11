@@ -170,7 +170,7 @@ class OptimizersContainer(Optimizer, Generic[T]):
             is_muon = issubclass(optimizer_cls, (Muon, DistributedMuon, DistributedMuonV2))
             is_scion = issubclass(optimizer_cls, Scion)
             if is_muon:
-                extra_kwargs.setdefault('model', model)
+                extra_kwargs.setdefault("model", model)
             if is_muon or is_scion:
                 kwargs.update(extra_kwargs)
             self.optimizers.append(optimizer_cls(params, **kwargs))
@@ -233,8 +233,8 @@ class OptimizersContainer(Optimizer, Generic[T]):
                         "Please check if the optimizer is initialized correctly."
                     )
                 buf = state["momentum_buffer"]
-                buf = buf.mul(1-momentum).add(g, alpha=momentum)
-                g = buf if not nesterov else buf.mul(1-momentum).add(g, alpha=momentum)
+                buf = buf.mul(1 - momentum).add(g, alpha=momentum)
+                g = buf if not nesterov else buf.mul(1 - momentum).add(g, alpha=momentum)
             if optimizer.fsdp_enabled:
                 g = gather_full_grad(g)
 
@@ -274,13 +274,13 @@ class OptimizersContainer(Optimizer, Generic[T]):
                         "eps": group["eps"],
                         "norm_factor": group["norm_factor"],
                         "zeropower_backend": zeropower_backends[group["backend"]],
-                        "backend_steps": group["backend_steps"]
+                        "backend_steps": group["backend_steps"],
                     }
                 elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
                     param_kwargs = {
-                        'eps': group['eps'],
-                        'betas': group['betas'],
-                        'weight_decay': group['weight_decay']
+                        "eps": group["eps"],
+                        "betas": group["betas"],
+                        "weight_decay": group["weight_decay"],
                     }
                 else:
                     warnings.warn(
@@ -497,7 +497,7 @@ def build_optimizers(
         width_multiplier = job_config.model.mup_width_multiplier
         # TODO Remove this deprecation handling at some point. Added on 2025-04-10.
         if "-multiplier-" in job_config.model.flavor:
-            flavor_multiplier = int(job_config.model.flavor.split('-multiplier-')[-1])
+            flavor_multiplier = int(job_config.model.flavor.split("-multiplier-")[-1])
             assert width_multiplier == flavor_multiplier, (
                 "`--model.mup_width_multiplier` does not match multiplier specified in flavor. "
                 "Please set `--model.mup_width_multiplier` to the μP multiplier; "
