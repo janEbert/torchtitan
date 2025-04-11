@@ -225,9 +225,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         color = self.metrics_processor.color
 
         # log model size
-        model_param_count = utils.get_num_params(model)
+        activate_params, model_param_count = utils.get_num_params(model)
+        activate_params_wo_embed, _ = utils.get_num_params(model, exclude_embedding=True)
         self.metrics_processor.num_flop_per_token = model_args.get_num_flop_per_token(
-            utils.get_num_params(model, exclude_embedding=True),
+            activate_params_wo_embed,
             job_config.training.seq_len,
         )
 
