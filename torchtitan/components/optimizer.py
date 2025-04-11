@@ -178,7 +178,7 @@ class OptimizersContainer(Optimizer, Generic[T]):
         self._validate_length(len(self.model_parts))
         # Do not separately save the external settings in
         # optimizer defaults.
-        del optimizer_kwargs["param_groups"]
+        optimizer_kwargs.pop("param_groups", None)
         optimizer_kwargs.update(optimizer_kwargs.pop("extra_kwargs", {}))
         self._post_init(all_params, optimizer_kwargs)
 
