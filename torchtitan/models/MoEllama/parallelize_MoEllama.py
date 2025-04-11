@@ -136,7 +136,7 @@ def parallelize_llama(
             pp_enabled=parallel_dims.pp_enabled,
             cpu_offload=job_config.training.enable_cpu_offload,
             reshard_after_forward_policy=job_config.parallelism.fsdp_reshard_after_forward,
-            ep_enabled=(parallel_dims.ep_mode == "naive_dp2ep"),
+            ep_enabled=parallel_dims.ep_mode == "naive_dp2ep" and parallel_dims.ep_enabled,
             dp_mod_ep_mesh=world_mesh[tuple(dp_mod_ep_mesh_dim_names)],
         )
 
@@ -391,7 +391,7 @@ def apply_compile(model: nn.Module):
     repeated structure. Alternatively one can compile the whole model (after applying DP).
     """
     for layer_id, transformer_block in model.layers.named_children():
-        transformer_block = torch.compile(transformer_block, fullgraph=True)
+        transformer_block = torch.compile(transformer_block)
         model.layers.register_module(layer_id, transformer_block)
 
     logger.info("Compiling each TransformerBlock with torch.compile")
@@ -455,6 +455,12 @@ def apply_fsdp(
         #     fully_shard(
         #         transformer_block.moe.experts,
         #         **fsdp_mod_ep_config,
+        #         reshard_after_forward=reshard_after_forward,
+        #     )
+        # if ep_enabled:
+        #     fully_shard(
+        #         transformer_block.feed_forward,
+        #         **fsdp_config,
         #         reshard_after_forward=reshard_after_forward,
         #     )
 
