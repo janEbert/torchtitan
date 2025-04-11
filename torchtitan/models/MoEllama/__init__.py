@@ -28,6 +28,17 @@ moe_llama3_configs = {
         activate_experts=8,
         n_routed_experts=64,
     ),
+    "1B-7B": MoEModelArgs(
+        dim=2048,
+        n_layers=16,
+        n_heads=16,
+        n_kv_heads=8,
+        rope_theta=500000,
+        n_shared_experts=1,
+        activate_experts=8,
+        n_routed_experts=64,
+        qk_norm=True,
+    ),
     "3B": MoEModelArgs(
         dim=3072,
         n_layers=28,
