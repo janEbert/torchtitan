@@ -86,31 +86,35 @@ def _extract_param_groups(
         if optimizer_config is not None
         else None
     )
+    if param_groups_config is None:
+        param_groups_config = []
 
-    if optimizer_config is None or not param_groups_config:
-        params = [p for p in model.parameters() if p.requires_grad]
-    else:
-        params = []
-        param_dict = OrderedDict((n, p) for n, p in model.named_parameters() if p.requires_grad)
+    param_dict = OrderedDict(
+        (n, p) for n, p in model.named_parameters() if p.requires_grad
+    )
+    params = []
 
-        for param_group_config in param_groups_config:
-            str_match = param_group_config.pop("param_str_match")
-            filter_fn = functools.partial(re.search, str_match)
-            param_names = [n for n in param_dict.keys() if filter_fn(n)]
-            group_params = {
-                "params": [param_dict.pop(n) for n in param_names],
-                "param_names": param_names,
-            }
-            assert len(group_params["params"]) == len(group_params["param_names"])
-            group_params.update(param_group_config)
-            params.append(group_params)
+    for param_group_config in param_groups_config:
+        str_match = param_group_config.pop("param_str_match")
+        filter_fn = functools.partial(re.search, str_match)
+        param_names = [n for n in param_dict.keys() if filter_fn(n)]
+        group_params = {
+            "params": [param_dict.pop(n) for n in param_names],
+            "param_names": param_names,
+        }
+        assert len(group_params["params"]) == len(group_params["param_names"])
+        group_params.update(param_group_config)
+        params.append(group_params)
 
-        param_names = list(param_dict.keys())
-        params.insert(
-            0,
-            {"params": [param_dict.pop(n) for n in param_names], "param_names": param_names},
-        )
-        assert not param_dict
+    param_names = list(param_dict.keys())
+    params.insert(
+        0,
+        {
+            "params": [param_dict.pop(n) for n in param_names],
+            "param_names": param_names,
+        },
+    )
+    assert not param_dict
     return params
 
 
