@@ -6,7 +6,7 @@ from typing import Callable
 from torchtitan.models.inits import build_init_fn
 
 
-class SeprateParamsGroupedExperts(nn.Module):
+class SeparateParamsGroupedExperts(nn.Module):
     """This class implements the grouped experts layer used in Mixture of Experts. Each expert
     is a variant of the Gated Linear Units network. See more details in https://arxiv.org/pdf/2002.05202.
 
