@@ -43,7 +43,9 @@ llama3_configs = {
     # 55M parameters
     "debugmodel-multiplier-2": TransformerModelArgs(
         dim=512, n_layers=16, n_heads=8, n_kv_heads=None, ffn_dim_multiplier=1, multiple_of=256,
-        rope_theta=500000, depth_init=False, qk_norm=True, norm_eps=1e-12, init_std=0
+        rope_theta=500000, depth_init=False, qk_norm=True, norm_eps=1e-12,
+        first_in_init_fn_type="orthogonal", intermediate_init_fn_type="orthogonal",
+        final_out_init_fn_type="zeros",
     ),
     # 206M parameters
     "debugmodel-multiplier-4": TransformerModelArgs(
