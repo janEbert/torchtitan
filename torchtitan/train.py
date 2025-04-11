@@ -364,7 +364,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         os.makedirs(self.job_config.job.dump_folder, exist_ok=True)
         job_config_save_path = os.path.join(
             self.job_config.job.dump_folder,
-            "job_config_" + datetime.now().strftime("%Y%m%d-%H%M") + ".json",
+            "job_config_" + datetime.datetime.now().strftime("%Y%m%d-%H%M") + ".json",
         )
         with open(job_config_save_path, "w") as f:
             json.dump(self.job_config.to_dict(), f)
