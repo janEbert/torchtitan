@@ -48,14 +48,33 @@ class GarbageCollection:
 
 
 def get_num_params(model: nn.Module, exclude_embedding: bool = False) -> int:
-    num_params = sum(p.numel() for p in model.parameters())
+    not_ffn_params = 0
+    ffn_params = 0
+
+    for p_name, param in model.named_parameters():
+        if "feed_forward.experts" in p_name:
+            ffn_params += param.numel()
+        else:
+            not_ffn_params += param.numel()
+
+    if hasattr(model, "get_sparsity_ratio"):
+        sparsity_ratio = model.get_sparsity_ratio()
+    else:
+        sparsity_ratio = 1
+
+    activate_params = not_ffn_params + ffn_params * sparsity_ratio
+    total_params = not_ffn_params + ffn_params
+
     if exclude_embedding:
-        num_params -= sum(
+        embed_params = sum(
             sum(p.numel() for p in m.parameters())
             for m in model.children()
             if isinstance(m, nn.Embedding)
         )
-    return num_params
+        activate_params -= embed_params
+        total_params -= embed_params
+
+    return activate_params, total_params
 
 
 # hardcoded BF16 type peak flops for NVIDIA A100, H100, H200 GPU and AMD MI250, MI300X, AMD MI325X and Intel PVC

@@ -20,7 +20,10 @@ from torch.distributed.elastic.multiprocessing.errors import record
 import torchtitan.components.ft as ft
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import cross_entropy_loss, multi_token_cross_entropy_loss
+from torchtitan.components.loss import (
+    cross_entropy_loss,
+    multi_token_cross_entropy_loss,
+)
 from torchtitan.components.metrics import (
     build_metrics_processor,
     ensure_pp_loss_visible,
@@ -137,8 +140,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # verify batch sizes
         if job_config.training.global_batch_size is None:
-            job_config.training.global_batch_size = \
+            job_config.training.global_batch_size = (
                 job_config.training.batch_size * dp_degree
+            )
         assert job_config.training.global_batch_size > 0
         assert (
             job_config.training.global_batch_size
@@ -150,9 +154,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"% ({job_config.training.batch_size} * {dp_degree}) != 0)"
         )
 
-        self.gradient_accumulation_steps = (
-            job_config.training.global_batch_size
-            // (job_config.training.batch_size * dp_degree)
+        self.gradient_accumulation_steps = job_config.training.global_batch_size // (
+            job_config.training.batch_size * dp_degree
         )
         assert self.gradient_accumulation_steps > 0
 
@@ -165,8 +168,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if job_config.training.num_mtp_tokens > 0:
             pre_mtp_loss_fn = self.train_spec.loss_fn
-            assert pre_mtp_loss_fn in [cross_entropy_loss, moe_loss], \
-                "MTP requires cross-entropy loss"
+            assert pre_mtp_loss_fn in [
+                cross_entropy_loss,
+                moe_loss,
+            ], "MTP requires cross-entropy loss"
             self.train_spec.loss_fn = functools.partial(
                 multi_token_cross_entropy_loss,
                 loss_fn=pre_mtp_loss_fn,
@@ -225,9 +230,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         color = self.metrics_processor.color
 
         # log model size
-        model_param_count = utils.get_num_params(model)
+        activate_params, model_param_count = utils.get_num_params(model)
+        activate_params_wo_embed, _ = utils.get_num_params(
+            model, exclude_embedding=True
+        )
         self.metrics_processor.num_flop_per_token = model_args.get_num_flop_per_token(
-            utils.get_num_params(model, exclude_embedding=True),
+            activate_params_wo_embed,
             job_config.training.seq_len,
         )
 
@@ -281,6 +289,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     m.init_weights(buffer_device=buffer_device)
                 m.train()
 
+            # TODO(JSC): remove this after fix MoE parallel
+            if parallel_dims.ep_enabled and parallel_dims.ep_mode == "naive_dp2ep":
+                for p_name, p in m.named_parameters():
+                    # force set grad to 0
+                    p.grad = torch.zeros_like(p)
+
+            m.train()
+
             # confirm that user will be able to view loss metrics on the console
             ensure_pp_loss_visible(parallel_dims, job_config, color)
         else:
@@ -288,6 +304,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             model = self.train_spec.parallelize_fn(
                 model, world_mesh, parallel_dims, job_config
             )
+
+            # TODO(JSC): remove this after fix MoE parallel
+            if parallel_dims.ep_enabled and parallel_dims.ep_mode == "naive_dp2ep":
+                for p_name, p in model.named_parameters():
+                    # force set grad to 0
+                    p.grad = torch.zeros_like(p)
 
             model.to_empty(device=init_device)
             with torch.no_grad():
@@ -364,7 +386,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         os.makedirs(self.job_config.job.dump_folder, exist_ok=True)
         job_config_save_path = os.path.join(
             self.job_config.job.dump_folder,
-            "job_config_" + datetime.now().strftime("%Y%m%d-%H%M") + ".json",
+            "job_config_" + datetime.datetime.now().strftime("%Y%m%d-%H%M") + ".json",
         )
         with open(job_config_save_path, "w") as f:
             json.dump(self.job_config.to_dict(), f)
@@ -407,7 +429,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if parallel_dims.pp_enabled:
             # Pipeline Parallel forward / backward inside step() call
-            with self.train_context(optional_context_parallel_ctx, self.activations_handling_ctx):
+            with self.train_context(
+                optional_context_parallel_ctx, self.activations_handling_ctx
+            ):
                 targets, losses = (
                     (labels, []) if self.pp_has_last_stage else (None, None)
                 )
@@ -441,7 +465,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return loss, aux_loss, moe_entropy_per_layer
 
     def train_step(self, data_iterator: Iterable):
-        self.optimizers.zero_grad()
+        # TODO(JSC): if we shard the MoE model, we need to remove the following code
+        self.optimizers.zero_grad(set_to_none=not self.parallel_dims.ep_enabled)
 
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
@@ -474,7 +499,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             for model in model_parts:
                 for p_name, p in model.named_parameters():
                     if "feed_forward.experts" in p_name:
-                        p.grad = p.grad * parallel_dims.ep
+                        if p.grad is not None:
+                            p.grad = p.grad * parallel_dims.ep
+                        else:
+                            raise Exception(f"p_name: {p_name} and p.grad is None")
 
         grad_norm = None
         if self.job_config.training.max_norm > 0:
@@ -492,7 +520,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         loss = torch.sum(torch.stack(self.metrics_processor.accumulated_losses))
         self.metrics_processor.accumulated_losses.clear()
         if len(self.metrics_processor.accumulated_aux_losses) > 0:
-            aux_loss = torch.sum(torch.stack(self.metrics_processor.accumulated_aux_losses))
+            aux_loss = torch.sum(
+                torch.stack(self.metrics_processor.accumulated_aux_losses)
+            )
             self.metrics_processor.accumulated_aux_losses.clear()
         if len(self.metrics_processor.accumulated_moe_entropy_per_layer) > 0:
             moe_entropy_per_layer = {}
@@ -540,17 +570,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if aux_loss is not None:
             extra_log_data["loss_metrics/aux_loss"] = aux_loss
         if moe_entropy_per_layer is not None:
-            for (k, v) in moe_entropy_per_layer.items():
+            for k, v in moe_entropy_per_layer.items():
                 extra_log_data[f"loss_metrics/moe_entropy_per_layer_{k}"] = v
 
         color = self.metrics_processor.color
         extra_print_data = ""
         if grad_norm is not None:
-            extra_print_data = (
-                f"{extra_print_data}  {color.green}gradnorm: {grad_norm:7.4f}{color.reset}"
-            )
+            extra_print_data = f"{extra_print_data}  {color.green}gradnorm: {grad_norm:7.4f}{color.reset}"
         self.metrics_processor.log(
-            self.step, global_avg_loss, global_max_loss, extra_log_data, extra_print_data,
+            self.step,
+            global_avg_loss,
+            global_max_loss,
+            extra_log_data,
+            extra_print_data,
         )
 
     @record
@@ -560,11 +592,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.checkpointer.load(step=job_config.checkpoint.load_step)
         logger.info(f"Training starts at step {self.step + 1}.")
 
-        with maybe_enable_profiling(
-            job_config, global_step=self.step
-        ) as torch_profiler, maybe_enable_memory_snapshot(
-            job_config, global_step=self.step
-        ) as memory_profiler:
+        with (
+            maybe_enable_profiling(job_config, global_step=self.step) as torch_profiler,
+            maybe_enable_memory_snapshot(
+                job_config, global_step=self.step
+            ) as memory_profiler,
+        ):
             data_iterator = iter(self.dataloader)
             while self.step < job_config.training.steps:
                 self.step += 1

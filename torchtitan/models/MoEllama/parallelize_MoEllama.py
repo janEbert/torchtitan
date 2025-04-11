@@ -112,6 +112,8 @@ def parallelize_llama(
 
     # turn on per-TransformerBlock compile after AC wrapping and before FSDP
     if job_config.training.compile:
+        # for EP, we need to set fullgraph=False
+
         apply_compile(model)
 
     if (
@@ -136,7 +138,9 @@ def parallelize_llama(
             pp_enabled=parallel_dims.pp_enabled,
             cpu_offload=job_config.training.enable_cpu_offload,
             reshard_after_forward_policy=job_config.parallelism.fsdp_reshard_after_forward,
-            ep_enabled=(parallel_dims.ep_mode == "naive_dp2ep"),
+            ep_enabled=(
+                parallel_dims.ep_mode == "naive_dp2ep" and parallel_dims.ep_enabled
+            ),
             dp_mod_ep_mesh=world_mesh[tuple(dp_mod_ep_mesh_dim_names)],
         )
 
@@ -239,10 +243,12 @@ def apply_tp(
             "feed_forward.w3": colwise_parallel(),
         }
         if isinstance(transformer_block, BitNetTransformerBlock):
-            layer_plan.update({
-                "attention.wo_norm": SequenceParallel(),
-                "feed_forward.w2_norm": SequenceParallel(),
-            })
+            layer_plan.update(
+                {
+                    "attention.wo_norm": SequenceParallel(),
+                    "feed_forward.w2_norm": SequenceParallel(),
+                }
+            )
 
         parallelize_module(
             module=transformer_block,
@@ -327,16 +333,21 @@ def _apply_ac_to_transformer_block(module: nn.Module, ac_config):
             CheckpointPolicy,
             create_selective_checkpoint_contexts,
         )
+
         if isinstance(module, BitNetTransformerBlock):
-            _save_list.update({
-                torch.ops.torchao.scaled_int8_mm.default,
-                torch.ops.aten._int_mm.default,
-                torch.ops.aten.mean.default,
-            })
-            mm_funs.extend([
-                torch.ops.torchao.scaled_int8_mm.default,
-                torch.ops.aten._int_mm.default,
-            ])
+            _save_list.update(
+                {
+                    torch.ops.torchao.scaled_int8_mm.default,
+                    torch.ops.aten._int_mm.default,
+                    torch.ops.aten.mean.default,
+                }
+            )
+            mm_funs.extend(
+                [
+                    torch.ops.torchao.scaled_int8_mm.default,
+                    torch.ops.aten._int_mm.default,
+                ]
+            )
 
         def _get_custom_policy(meta):
             def _custom_policy(ctx, func, *args, **kwargs):
@@ -391,7 +402,9 @@ def apply_compile(model: nn.Module):
     repeated structure. Alternatively one can compile the whole model (after applying DP).
     """
     for layer_id, transformer_block in model.layers.named_children():
-        transformer_block = torch.compile(transformer_block, fullgraph=True)
+        transformer_block = torch.compile(
+            transformer_block,
+        )
         model.layers.register_module(layer_id, transformer_block)
 
     logger.info("Compiling each TransformerBlock with torch.compile")
@@ -455,6 +468,12 @@ def apply_fsdp(
         #     fully_shard(
         #         transformer_block.moe.experts,
         #         **fsdp_mod_ep_config,
+        #         reshard_after_forward=reshard_after_forward,
+        #     )
+        # if ep_enabled:
+        #     fully_shard(
+        #         transformer_block.feed_forward,
+        #         **fsdp_config,
         #         reshard_after_forward=reshard_after_forward,
         #     )
 

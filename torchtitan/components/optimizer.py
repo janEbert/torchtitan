@@ -52,7 +52,9 @@ def supremum_norm(x):
 
 @torch.no_grad()
 def l1_to_rms_norm(W):
-    norm = torch.max(torch.linalg.norm(W.to(torch.float32), ord=2, dim=0, dtype=torch.float32))
+    norm = torch.max(
+        torch.linalg.norm(W.to(torch.float32), ord=2, dim=0, dtype=torch.float32)
+    )
     scale = torch.sqrt(torch.tensor(W.shape[0], dtype=W.dtype, device=W.device))
     norm /= scale
     return norm
@@ -60,7 +62,9 @@ def l1_to_rms_norm(W):
 
 @torch.no_grad()
 def rms_to_l1_norm(W):
-    norm = torch.max(torch.linalg.norm(W.to(torch.float32), ord=2, dim=1, dtype=torch.float32))
+    norm = torch.max(
+        torch.linalg.norm(W.to(torch.float32), ord=2, dim=1, dtype=torch.float32)
+    )
     scale = torch.sqrt(torch.tensor(W.shape[1], dtype=W.dtype, device=W.device))
     norm *= scale
     return norm
@@ -84,12 +88,12 @@ def _extract_param_groups(
         else None
     )
 
-    if optimizer_config is None or not param_groups_config:
-        params = [p for p in model.parameters() if p.requires_grad]
-    else:
-        params = []
-        param_dict = OrderedDict((n, p) for n, p in model.named_parameters() if p.requires_grad)
+    params = []
+    param_dict = OrderedDict(
+        (n, p) for n, p in model.named_parameters() if p.requires_grad
+    )
 
+    if param_groups_config is not None:
         for param_group_config in param_groups_config:
             str_match = param_group_config.pop("param_str_match")
             filter_fn = functools.partial(re.search, str_match)
@@ -102,12 +106,15 @@ def _extract_param_groups(
             group_params.update(param_group_config)
             params.append(group_params)
 
-        param_names = list(param_dict.keys())
-        params.insert(
-            0,
-            {"params": [param_dict.pop(n) for n in param_names], "param_names": param_names},
-        )
-        assert not param_dict
+    param_names = list(param_dict.keys())
+    params.insert(
+        0,
+        {
+            "params": [param_dict.pop(n) for n in param_names],
+            "param_names": param_names,
+        },
+    )
+    assert not param_dict
     return params
 
 
@@ -164,10 +171,12 @@ class OptimizersContainer(Optimizer, Generic[T]):
             params = _extract_param_groups(model, kwargs)
 
             # For Muon, we need to pass the model as well
-            is_muon = issubclass(optimizer_cls, (Muon, DistributedMuon, DistributedMuonV2))
+            is_muon = issubclass(
+                optimizer_cls, (Muon, DistributedMuon, DistributedMuonV2)
+            )
             is_scion = issubclass(optimizer_cls, Scion)
             if is_muon:
-                extra_kwargs.setdefault('model', model)
+                extra_kwargs.setdefault("model", model)
             if is_muon or is_scion:
                 kwargs.update(extra_kwargs)
             self.optimizers.append(optimizer_cls(params, **kwargs))
@@ -175,7 +184,8 @@ class OptimizersContainer(Optimizer, Generic[T]):
         self._validate_length(len(self.model_parts))
         # Do not separately save the external settings in
         # optimizer defaults.
-        del optimizer_kwargs["param_groups"]
+        if "param_groups" in optimizer_kwargs:
+            del optimizer_kwargs["param_groups"]
         optimizer_kwargs.update(optimizer_kwargs.pop("extra_kwargs", {}))
         self._post_init(all_params, optimizer_kwargs)
 
@@ -230,8 +240,12 @@ class OptimizersContainer(Optimizer, Generic[T]):
                         "Please check if the optimizer is initialized correctly."
                     )
                 buf = state["momentum_buffer"]
-                buf = buf.mul(1-momentum).add(g, alpha=momentum)
-                g = buf if not nesterov else buf.mul(1-momentum).add(g, alpha=momentum)
+                buf = buf.mul(1 - momentum).add(g, alpha=momentum)
+                g = (
+                    buf
+                    if not nesterov
+                    else buf.mul(1 - momentum).add(g, alpha=momentum)
+                )
             if optimizer.fsdp_enabled:
                 g = gather_full_grad(g)
 
@@ -240,15 +254,26 @@ class OptimizersContainer(Optimizer, Generic[T]):
             eps = kwargs["eps"]
             weight_decay = kwargs["weight_decay"]
             beta1, beta2 = kwargs["betas"]
-            assert weight_decay == 0.0, "Weight decay not supported for grad computation."
+            assert (
+                weight_decay == 0.0
+            ), "Weight decay not supported for grad computation."
 
             param_optim_state = optimizer.state[p]
-            step = param_optim_state["step"].item()
-            bias_correction1 = 1 - beta1**step
-            bias_correction2 = 1 - beta2**step
-            denom = (param_optim_state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2)) + eps
-            step_size = 1 / bias_correction1
-            g = step_size * param_optim_state["exp_avg"].div(denom)
+            if "step" not in param_optim_state:
+                step = 0
+            else:
+                step = param_optim_state["step"].item()
+            if "exp_avg_sq" in param_optim_state and "exp_avg" in param_optim_state:
+                bias_correction1 = 1 - beta1**step
+                bias_correction2 = 1 - beta2**step
+                denom = (
+                    param_optim_state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2)
+                ) + eps
+                step_size = 1 / bias_correction1
+                g = step_size * param_optim_state["exp_avg"].div(denom)
+            else:
+                # TODO(JSC): if we shard the MoE model, we need to remove the following code
+                g = p.grad
 
             assert isinstance(g, DTensor), "Expected gradient to be a DTensor"
             return g.redistribute(placements=[Replicate()] * g.device_mesh.ndim)
@@ -271,14 +296,21 @@ class OptimizersContainer(Optimizer, Generic[T]):
                         "eps": group["eps"],
                         "norm_factor": group["norm_factor"],
                         "zeropower_backend": zeropower_backends[group["backend"]],
-                        "backend_steps": group["backend_steps"]
+                        "backend_steps": group["backend_steps"],
                     }
                 elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
                     param_kwargs = {
-                        'eps': group['eps'],
-                        'betas': group['betas'],
-                        'weight_decay': group['weight_decay']
+                        "eps": group["eps"],
+                        "betas": group["betas"],
+                        "weight_decay": group["weight_decay"],
                     }
+                elif "param_names" not in group or "params" not in group:
+                    warnings.warn(
+                        f"Optimizer {optimizer.__class__.__name__} does not support "
+                        f"norm computation."
+                    )
+
+                    continue
                 else:
                     warnings.warn(
                         f"Optimizer {optimizer.__class__.__name__} does not support "
@@ -301,8 +333,28 @@ class OptimizersContainer(Optimizer, Generic[T]):
                         if "tok_embeddings" in n:
                             p, update = p.T, update.T
                         for norm_name, norm_func in NORM_FUNCTIONS.items():
-                            norms[f"model_part_{i}/{n}/param/{norm_name}"] = norm_func(p)
-                            norms[f"model_part_{i}/{n}/update/{norm_name}"] = norm_func(update)
+                            if norm_name == "rms_to_l1" and p.ndim < 2:
+                                # In case we have lernable Layer/RMSNorm
+                                continue
+                            if norm_name == "spectral" and (
+                                p.ndim == 3 or update.ndim == 3
+                            ):
+                                for ep_idx in range(p.shape[0]):
+                                    norms[
+                                        f"model_part_{i}/{n}_{ep_idx}/param/{norm_name}"
+                                    ] = norm_func(p[ep_idx])
+                                    norms[
+                                        f"model_part_{i}/{n}_{ep_idx}/update/{norm_name}"
+                                    ] = norm_func(update[ep_idx])
+                                continue
+
+                            else:
+                                norms[f"model_part_{i}/{n}/param/{norm_name}"] = (
+                                    norm_func(p)
+                                )
+                                norms[f"model_part_{i}/{n}/update/{norm_name}"] = (
+                                    norm_func(update)
+                                )
         return norms
 
     def get_lrs(self):
@@ -483,7 +535,7 @@ def build_optimizers(
         width_multiplier = job_config.model.mup_width_multiplier
         # TODO Remove this deprecation handling at some point. Added on 2025-04-10.
         if "-multiplier-" in job_config.model.flavor:
-            flavor_multiplier = int(job_config.model.flavor.split('-multiplier-')[-1])
+            flavor_multiplier = int(job_config.model.flavor.split("-multiplier-")[-1])
             assert width_multiplier == flavor_multiplier, (
                 "`--model.mup_width_multiplier` does not match multiplier specified in flavor. "
                 "Please set `--model.mup_width_multiplier` to the μP multiplier; "
@@ -494,7 +546,8 @@ def build_optimizers(
             "lr": lr / width_multiplier,
             "eps": eps / width_multiplier,
             "betas": (0.9, 0.95),
-            "weight_decay": weight_decay * width_multiplier,  # WD is coupled with LR in torch AdamW
+            "weight_decay": weight_decay
+            * width_multiplier,  # WD is coupled with LR in torch AdamW
             "fused": fused,
             "foreach": foreach,
         }
