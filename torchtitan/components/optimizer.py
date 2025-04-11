@@ -41,17 +41,14 @@ T = TypeVar("T", bound=Optimizer)
 
 
 @torch.no_grad()
-def spectral_norm(x):
-    return torch.linalg.norm(x.to(torch.float32), ord=2, dtype=torch.float32)
-
-
-@torch.no_grad()
-def supremum_norm(x):
-    return x.abs().max()
+def spectral_norm(W):
+    assert W.ndim >= 2, "operator norm can only be applied to matrices"
+    return torch.linalg.norm(W.to(torch.float32), ord=2, dtype=torch.float32)
 
 
 @torch.no_grad()
 def l1_to_rms_norm(W):
+    assert W.ndim >= 2, "operator norm can only be applied to matrices"
     norm = torch.max(torch.linalg.norm(W.to(torch.float32), ord=2, dim=0, dtype=torch.float32))
     scale = torch.sqrt(torch.tensor(W.shape[0], dtype=W.dtype, device=W.device))
     norm /= scale
@@ -60,17 +57,23 @@ def l1_to_rms_norm(W):
 
 @torch.no_grad()
 def rms_to_l1_norm(W):
+    assert W.ndim >= 2, "operator norm can only be applied to matrices"
     norm = torch.max(torch.linalg.norm(W.to(torch.float32), ord=2, dim=1, dtype=torch.float32))
     scale = torch.sqrt(torch.tensor(W.shape[1], dtype=W.dtype, device=W.device))
     norm *= scale
     return norm
 
 
+@torch.no_grad()
+def supremum_norm(x):
+    return x.abs().max()
+
+
 NORM_FUNCTIONS = {
     "spectral": spectral_norm,
-    "supremum": supremum_norm,
     "l1_to_rms": l1_to_rms_norm,
     "rms_to_l1": rms_to_l1_norm,
+    "supremum": supremum_norm,
 }
 
 
@@ -301,8 +304,19 @@ class OptimizersContainer(Optimizer, Generic[T]):
                         if "tok_embeddings" in n:
                             p, update = p.T, update.T
                         for norm_name, norm_func in NORM_FUNCTIONS.items():
-                            norms[f"model_part_{i}/{n}/param/{norm_name}"] = norm_func(p)
-                            norms[f"model_part_{i}/{n}/update/{norm_name}"] = norm_func(update)
+                            if norm_name != "supremum" and (p.ndim < 2 or update.ndim < 2):
+                                # Operator norms require a matrix.
+                                continue
+                            else:
+                                if p.dim > 2 or update.ndim > 2:
+                                    warnings.warn(
+                                        f"Encountered parameter or update {n} with shape "
+                                        f"{p.shape} or {update.shape}, respectively; "
+                                        f"this may not be an issue, but please ensure its "
+                                        f"norms are calculated correctly."
+                                    )
+                                norms[f"model_part_{i}/{n}/param/{norm_name}"] = norm_func(p)
+                                norms[f"model_part_{i}/{n}/update/{norm_name}"] = norm_func(update)
         return norms
 
     def get_lrs(self):
