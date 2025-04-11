@@ -22,11 +22,11 @@ from torchtitan.components.tokenizer import Tokenizer
 from torchtitan.config_manager import JobConfig
 from torchtitan.tools.logging import logger
 
-from .SeprateParamsGroupedExperts import SeprateParamsGroupedExperts
+from .SeparateParamsGroupedExperts import SeparateParamsGroupedExperts
 from .GroupedExperts import GroupedExperts
 
 experts_impl_dict = {
-    "seprate": SeprateParamsGroupedExperts,
+    "separate": SeparateParamsGroupedExperts,
     "group": GroupedExperts,
 }
 
@@ -80,7 +80,7 @@ class MoEModelArgs(BaseModelArgs):
     moe_aux_loss_alpha: float = 0.01
     moe_gate_use_bias_for_routing: bool = True
     experts_impl: str = (
-        "group"  # "group" or "seprate", seprate-params works with muon for now
+        "group"  # "group" or "separate", separate-params works with muon for now
     )
 
     def update_from_config(self, job_config: JobConfig, tokenizer: Tokenizer) -> None:
