@@ -24,7 +24,12 @@ from torch.optim import Optimizer
 
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config_manager import JobConfig
-from torchtitan.optimizers import DistributedMuon, DistributedMuonV2, Muon, Scion
+from torchtitan.optimizers import (
+    DistributedMuon,
+    DistributedMuonV2,
+    Muon,
+    Scion,
+)
 from torchtitan.optimizers.muon_utils import gather_full_grad, zeropower_backends
 
 __all__ = [
@@ -49,7 +54,9 @@ def spectral_norm(W):
 @torch.no_grad()
 def l1_to_rms_norm(W):
     assert W.ndim >= 2, "operator norm can only be applied to matrices"
-    norm = torch.max(torch.linalg.norm(W.to(torch.float32), ord=2, dim=0, dtype=torch.float32))
+    norm = torch.max(
+        torch.linalg.norm(W.to(torch.float32), ord=2, dim=0, dtype=torch.float32)
+    )
     scale = torch.sqrt(torch.tensor(W.shape[0], dtype=W.dtype, device=W.device))
     norm /= scale
     return norm
@@ -58,7 +65,9 @@ def l1_to_rms_norm(W):
 @torch.no_grad()
 def rms_to_l1_norm(W):
     assert W.ndim >= 2, "operator norm can only be applied to matrices"
-    norm = torch.max(torch.linalg.norm(W.to(torch.float32), ord=2, dim=1, dtype=torch.float32))
+    norm = torch.max(
+        torch.linalg.norm(W.to(torch.float32), ord=2, dim=1, dtype=torch.float32)
+    )
     scale = torch.sqrt(torch.tensor(W.shape[1], dtype=W.dtype, device=W.device))
     norm *= scale
     return norm
@@ -171,7 +180,10 @@ class OptimizersContainer(Optimizer, Generic[T]):
             params = _extract_param_groups(model, kwargs)
 
             # For Muon, we need to pass the model as well
-            is_muon = issubclass(optimizer_cls, (Muon, DistributedMuon, DistributedMuonV2))
+            is_muon = issubclass(
+                optimizer_cls,
+                (Muon, DistributedMuon, DistributedMuonV2),
+            )
             is_scion = issubclass(optimizer_cls, Scion)
             if is_muon:
                 extra_kwargs.setdefault("model", model)
@@ -238,16 +250,22 @@ class OptimizersContainer(Optimizer, Generic[T]):
                     )
                 buf = state["momentum_buffer"]
                 buf = buf.mul(1 - momentum).add(g, alpha=momentum)
-                g = buf if not nesterov else buf.mul(1 - momentum).add(g, alpha=momentum)
+                g = (
+                    buf
+                    if not nesterov
+                    else buf.mul(1 - momentum).add(g, alpha=momentum)
+                )
             if optimizer.fsdp_enabled:
-                g = gather_full_grad(g)
+                g = gather_full_grad(g).to_local()
 
             return optimizer.lmo(g, **kwargs)
         elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
             eps = kwargs["eps"]
             weight_decay = kwargs["weight_decay"]
             beta1, beta2 = kwargs["betas"]
-            assert weight_decay == 0.0, "Weight decay not supported for grad computation."
+            assert (
+                weight_decay == 0.0
+            ), "Weight decay not supported for grad computation."
 
             param_optim_state = optimizer.state[p]
             if "step" not in param_optim_state:
@@ -257,7 +275,9 @@ class OptimizersContainer(Optimizer, Generic[T]):
             if "exp_avg_sq" in param_optim_state and "exp_avg" in param_optim_state:
                 bias_correction1 = 1 - beta1**step
                 bias_correction2 = 1 - beta2**step
-                denom = (param_optim_state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2)) + eps
+                denom = (
+                    param_optim_state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2)
+                ) + eps
                 step_size = 1 / bias_correction1
                 g = step_size * param_optim_state["exp_avg"].div(denom)
             else:
@@ -315,7 +335,9 @@ class OptimizersContainer(Optimizer, Generic[T]):
                         if "tok_embeddings" in n:
                             p, update = p.T, update.T
                         for norm_name, norm_func in NORM_FUNCTIONS.items():
-                            if norm_name != "supremum" and (p.ndim < 2 or update.ndim < 2):
+                            if norm_name != "supremum" and (
+                                p.ndim < 2 or update.ndim < 2
+                            ):
                                 # Operator norms require a matrix.
                                 continue
                             elif p.ndim == 3 or update.ndim == 3:
@@ -328,15 +350,19 @@ class OptimizersContainer(Optimizer, Generic[T]):
                                         f"model_part_{i}/ep_{ep_idx}/{n}/update/{norm_name}"
                                     ] = norm_func(update[ep_idx])
                             else:
-                                if p.dim > 2 or update.ndim > 2:
+                                if p.ndim > 2 or update.ndim > 2:
                                     warnings.warn(
                                         f"Encountered parameter or update {n} with shape "
                                         f"{p.shape} or {update.shape}, respectively; "
                                         f"this may not be an issue, but please ensure its "
                                         f"norms are calculated correctly."
                                     )
-                                norms[f"model_part_{i}/{n}/param/{norm_name}"] = norm_func(p)
-                                norms[f"model_part_{i}/{n}/update/{norm_name}"] = norm_func(update)
+                                norms[f"model_part_{i}/{n}/param/{norm_name}"] = (
+                                    norm_func(p)
+                                )
+                                norms[f"model_part_{i}/{n}/update/{norm_name}"] = (
+                                    norm_func(update)
+                                )
         return norms
 
     def get_lrs(self):
@@ -507,13 +533,23 @@ def build_optimizers(
     weight_decay = job_config.optimizer.weight_decay
 
     width_multiplier = 1
-    if name in ["Adam", "AdamW", "Muon", "DistributedMuon", "DistributedMuonV2"]:
+    if name in [
+        "Adam",
+        "AdamW",
+        "Muon",
+        "DistributedMuon",
+        "DistributedMuonV2",
+    ]:
         optim_implementation = job_config.optimizer.implementation
         assert optim_implementation in ["fused", "foreach", "for-loop"]
 
         fused = optim_implementation == "fused"
         foreach = optim_implementation == "foreach"
 
+        mesh_dim_names = extra_kwargs["world_mesh"].mesh_dim_names
+        ep_enable = "dp_shard_1" in mesh_dim_names or "dp_shard_2" in mesh_dim_names
+        if ep_enable:
+            fused = False
         width_multiplier = job_config.model.mup_width_multiplier
         # TODO Remove this deprecation handling at some point. Added on 2025-04-10.
         if "-multiplier-" in job_config.model.flavor:
@@ -528,7 +564,8 @@ def build_optimizers(
             "lr": lr / width_multiplier,
             "eps": eps / width_multiplier,
             "betas": (0.9, 0.95),
-            "weight_decay": weight_decay * width_multiplier,  # WD is coupled with LR in torch AdamW
+            "weight_decay": weight_decay
+            * width_multiplier,  # WD is coupled with LR in torch AdamW
             "fused": fused,
             "foreach": foreach,
         }

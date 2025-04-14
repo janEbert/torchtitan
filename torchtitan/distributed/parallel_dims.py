@@ -68,9 +68,9 @@ class ParallelDims:
         return self._build_mesh(device_type, init_device_mesh)
 
     def _build_mesh_with_naive_dp2ep(
-            self,
-            device_type: str,
-            init_device_mesh_fn: Callable,
+        self,
+        device_type: str,
+        init_device_mesh_fn: Callable,
     ):
         # In dp2ep, dp_shard and ep are derived submeshes:
         # dp_shard = dp_shard_1 * dp_shard_2

@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import math
-from typing import NotRequired, Optional, Union
+from typing import NotRequired, Optional, Union, Callable
 
 from einops import rearrange
 import torch
@@ -264,6 +264,36 @@ class Gate(nn.Module):
                 self._num_accumulated.zero_()
 
 
+class SharedExperts(nn.Module):
+    def __init__(
+        self, dim: int, hidden_dim: int, activation: Callable = torch.nn.functional.silu
+    ):
+        super().__init__()
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.up_proj = nn.Linear(hidden_dim, dim, bias=False)
+        self.act_fn = activation
+
+    def forward(self, x):
+        h = self.act_fn(self.gate_proj(x))
+        h = h * self.down_proj(x)
+        out = self.up_proj(h)
+        return out
+
+    def init_weights(
+        self,
+        init_std: float,
+        residual_div: float,
+        init_gate_as_residual: bool,
+        init_fn_type: str,
+    ):
+        init_fn = build_init_fn(init_fn_type)
+        init_fn(self.gate_proj.weight, mean=0.0, std=init_std)
+        init_fn(self.up_proj.weight, mean=0.0, std=init_std / residual_div)
+        gate_init_std = init_std / residual_div if init_gate_as_residual else init_std
+        init_fn(self.down_proj.weight, mean=0.0, std=gate_init_std)
+
+
 class MoE(nn.Module):
     def __init__(
         self,
@@ -318,9 +348,16 @@ class MoE(nn.Module):
         experts_impl_cls = experts_impl_dict[experts_impl]
         # Shared Experts (applies to all tokens)
         if n_shared_experts > 0:
-            self.shared_experts = experts_impl_cls(
-                dim_in=dim, dim_out=hidden_dim, num_experts=n_shared_experts
-            )
+            assert n_shared_experts == 1, "Only one shared expert is supported"
+            """
+            TODO(JSC):
+            To make Muon work easier, we set the shared experts to either 0 or 1.
+            So we dont use the GroupedExperts.
+            """
+            # self.shared_experts = experts_impl_cls(
+            #     dim_in=dim, dim_out=hidden_dim, num_experts=n_shared_experts
+            # )
+            self.shared_experts = SharedExperts(dim, hidden_dim)
 
         else:
             self.shared_experts = None
