@@ -9,7 +9,11 @@ import torch.distributed.tensor
 from torch.distributed.tensor import DTensor
 
 from torchtitan.models.inits import build_init_fn
-from torchtitan.models.llama.model import Attention, precompute_freqs_cis, TransformerInputsDict
+from torchtitan.models.llama.model import (
+    Attention,
+    precompute_freqs_cis,
+    TransformerInputsDict,
+)
 from torchtitan.models.norms import build_norm
 from torchtitan.protocols.train_spec import BaseModelArgs, ModelProtocol
 
@@ -19,6 +23,7 @@ from torchtitan.tools.logging import logger
 
 from .SeparateParamsGroupedExperts import SeparateParamsGroupedExperts
 from .GroupedExperts import GroupedExperts
+from . import ep_comm
 
 experts_impl_dict = {
     "separate": SeparateParamsGroupedExperts,
@@ -72,7 +77,7 @@ class MoEModelArgs(BaseModelArgs):
     n_routed_experts: int = 0
     activate_experts: int = 0
     moe_gate_bias_update_speed: float = 0.001
-    moe_aux_loss_alpha: float = 0.01
+    moe_aux_loss_alpha: float = 0.001
     moe_gate_use_bias_for_routing: bool = True
     experts_impl: str = (
         "group"  # "group" or "separate", separate-params works with muon for now
@@ -80,18 +85,18 @@ class MoEModelArgs(BaseModelArgs):
 
     def update_from_config(self, job_config: JobConfig, tokenizer: Tokenizer) -> None:
         for name in [
-                "first_in_init_fn_type",
-                "first_in_init_std",
-                "first_in_exp",
-                "intermediate_init_fn_type",
-                "intermediate_init_std",
-                "intermediate_exp",
-                "init_gate_as_residual",
-                "final_out_init_fn_type",
-                "final_out_init_std",
-                "final_out_exp",
-                "norm_type",
-                "use_flex_attn",
+            "first_in_init_fn_type",
+            "first_in_init_std",
+            "first_in_exp",
+            "intermediate_init_fn_type",
+            "intermediate_init_std",
+            "intermediate_exp",
+            "init_gate_as_residual",
+            "final_out_init_fn_type",
+            "final_out_init_std",
+            "final_out_exp",
+            "norm_type",
+            "use_flex_attn",
         ]:
             value = getattr(job_config.model, name)
             setattr(self, name, value)
@@ -99,8 +104,7 @@ class MoEModelArgs(BaseModelArgs):
         if job_config.model.vocab_size_multiple_of:
             vocab_divisor = job_config.model.vocab_size_multiple_of
             self.vocab_size = int(
-                math.ceil(self.vocab_size / vocab_divisor)
-                * vocab_divisor
+                math.ceil(self.vocab_size / vocab_divisor) * vocab_divisor
             )
             logger.info(
                 f"Padded vocab size from {tokenizer.n_words} to {self.vocab_size}."
@@ -135,6 +139,9 @@ MoEInputs = Union[torch.Tensor, MoEInputsDict]
 
 
 class Gate(nn.Module):
+    bias: torch.Tensor
+    _accumulated_adjustment: torch.Tensor
+
     def __init__(
         self, hidden_size: int, experts=8, topk=2, bias=True, bias_update_speed=0.01
     ):
@@ -144,24 +151,37 @@ class Gate(nn.Module):
         self.experts = experts
         self.expert_embeddings = nn.Parameter(torch.randn(experts, hidden_size))
         # Expert embeddings
-        bias = False if experts <= 1 else bias  # no bias for single expert
-        self.bias = (
-            nn.Parameter(torch.zeros(experts), requires_grad=False) if bias else None
-        )
+
+        if bias and experts > 1:
+            self.register_buffer("bias", torch.zeros(experts, dtype=torch.float32))
+        else:
+            self.bias = None
+
         # Bias for load balancing
         self.bias_update_speed = bias_update_speed
         # Step size for updating bias dynamically
 
         # Cache for accumulated adjustments
-        self._accumulated_adjustment = None
-        self._num_accumulated = 0
-        self.needs_reduce_bias_update = False
+        """
+        TODO(JSC):
+        Potential bug here.  When we use accumulated_gradient [? and PP], and load the checkpoint,
+        the self._accumulated_adjustment will be reset to zero. 
+        ---- 
+        With buffer, the above problem [seems] will not happen. but new problem is we should always make sure
+        the checkpoint is always saved right after the update.  Because we dont wand to all-reduce 
+        the _accumulated_adjustment in an intermediate steps. 
+        """
+        self.register_buffer(
+            "_accumulated_adjustment", torch.zeros(experts, dtype=torch.int32)
+        )
+        self.register_buffer("_num_accumulated", torch.tensor(0, dtype=torch.int32))
+        self.register_buffer("needs_reduction", torch.tensor(False), persistent=False)
 
     def __repr__(self):
         return f"Gate(experts={self.experts}, topk={self.topk}, bias={self.bias is not None})"
 
     def init_weights(self):
-        # nn.init.xavier_uniform_(self.expert_embeddings)
+        nn.init.xavier_uniform_(self.expert_embeddings)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
 
@@ -198,35 +218,35 @@ class Gate(nn.Module):
         Accumulate local expert counts without any all-reduce.
         """
         with torch.no_grad():
-            # Count local expert usage only
-            local_expert_counts = torch.bincount(
-                indices.flatten(), minlength=self.experts
-            ).float()
+            local_expert_counts = torch.zeros(
+                self.experts, device=indices.device, dtype=torch.int32
+            )
+            local_expert_counts.scatter_add_(
+                0,
+                indices.flatten(),
+                torch.ones_like(indices.flatten(), dtype=torch.int32),
+            )
 
-            # Just store the local counts
-            if self._accumulated_adjustment is None:
-                self._accumulated_adjustment = local_expert_counts
-            else:
-                self._accumulated_adjustment += local_expert_counts
-            self._num_accumulated += 1
-            self.needs_reduction = True
+            self._accumulated_adjustment.add_(local_expert_counts)
+            self._num_accumulated.add_(1)
+            self.needs_reduction.fill_(True)
 
     def update(self):
         """
         Apply accumulated bias adjustments and clear the cache.
         Now with all-reduce moved here (after backward).
         """
-        if self._accumulated_adjustment is not None and self._num_accumulated > 0:
+        if self._num_accumulated > 0:
             with torch.no_grad():
                 if self.needs_reduction:
                     # Only do the all-reduce if needed and not already done
                     torch.distributed.all_reduce(
                         self._accumulated_adjustment, op=torch.distributed.ReduceOp.SUM
                     )
-                    self.needs_reduction = False
+                    self.needs_reduction.fill_(False)
 
                 # Calculate and apply adjustment
-                avg_usage = self._accumulated_adjustment.mean()
+                avg_usage = self._accumulated_adjustment / self.experts
                 load_error = avg_usage - self._accumulated_adjustment
                 adjustment = torch.sign(load_error) * self.bias_update_speed
 
@@ -240,8 +260,8 @@ class Gate(nn.Module):
                 else:
                     self.bias.data.add_(adjustment.detach())
 
-                self._accumulated_adjustment *= 0
-                self._num_accumulated = 0
+                self._accumulated_adjustment.zero_()
+                self._num_accumulated.zero_()
 
 
 class MoE(nn.Module):
@@ -255,8 +275,8 @@ class MoE(nn.Module):
         ffn_dim_multiplier: Optional[float] = None,
         match_dim_with_dense: bool = True,
         use_bias_for_routing: bool = True,
-        bias_update_speed: float = 0.01,  # Bias adjustment speed
-        aux_loss_alpha: float = 0.01,  # Small weight for sequence-wise auxiliary loss
+        bias_update_speed: float = 0.001,  # Bias adjustment speed
+        aux_loss_alpha: float = 0.001,  # Small weight for sequence-wise auxiliary loss
         experts_impl: str = "group",  # "group" or "separate"
     ):
         super().__init__()
@@ -315,11 +335,11 @@ class MoE(nn.Module):
             self.experts = None
 
     def init_weights(
-            self,
-            init_std: float,
-            residual_div: float,
-            init_gate_as_residual: bool,
-            init_fn_type: str,
+        self,
+        init_std: float,
+        residual_div: float,
+        init_gate_as_residual: bool,
+        init_fn_type: str,
     ):
         if self.experts is not None:
             self.experts.init_weights(
@@ -360,11 +380,21 @@ class MoE(nn.Module):
                 sorted_tokens_shape = idxs.shape + x.shape[1:]
 
             sorted_tokens = x[idxs // indices.shape[1]]
+            experts_input, all_tokens_per_expert = ep_comm.dispatch_tokens(
+                sorted_tokens,
+                self.experts.ep_size,
+                self.experts.ep_mesh,
+                tokens_per_expert,
+            )
 
-            routed_output = self.experts(sorted_tokens, tokens_per_expert)
+            experts_output = self.experts(experts_input)
 
-            # Prepare the output buffer
-            out = torch.zeros_like(x)
+            routed_output = ep_comm.combine_tokens(
+                experts_output,
+                self.experts.ep_size,
+                self.experts.ep_mesh,
+                all_tokens_per_expert,
+            )
 
             # Map back from sorted tokens to original positions
             original_token_indices = idxs // indices.shape[1]
@@ -377,16 +407,8 @@ class MoE(nn.Module):
         # Apply shared experts if they exist
         if self.shared_experts is not None:
             # Reshape input for shared experts: (n_shared_experts, B*S, dim)
-
-            shared_input = torch.cat([x] * self.n_shared_experts, dim=0)
-            tokens_per_expert = torch.ones(self.n_shared_experts, device=x.device) * (
-                bz * slen
-            )
-
-            shared_output = self.shared_experts(shared_input, tokens_per_expert)
-            shared_output = rearrange(
-                shared_output, "(ep bs) d -> ep bs d", ep=self.n_shared_experts
-            ).sum(0)
+            shared_input = torch.stack([x] * self.n_shared_experts, dim=0)
+            shared_output = self.shared_experts(shared_input).sum(0)
 
             out = out + shared_output
 
@@ -515,7 +537,7 @@ class TransformerBlock(nn.Module):
         self.weight_init_fn_type = model_args.intermediate_init_fn_type
         self.weight_init_std = (
             model_args.intermediate_init_std
-            * model_args.dim ** model_args.intermediate_exp
+            * model_args.dim**model_args.intermediate_exp
         )
         if model_args.depth_init:
             self.residual_div = (2 * (self.layer_id + 1)) ** 0.5
@@ -610,7 +632,9 @@ class Transformer(nn.Module, ModelProtocol):
 
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(model_args.n_layers):
-            self.layers[str(layer_id)] = self.transformer_block_cls(layer_id, model_args)
+            self.layers[str(layer_id)] = self.transformer_block_cls(
+                layer_id, model_args
+            )
 
         self.norm = build_norm(
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
@@ -640,7 +664,7 @@ class Transformer(nn.Module, ModelProtocol):
         first_in_init_fn = build_init_fn(self.model_args.first_in_init_fn_type)
         first_in_std = (
             self.model_args.first_in_init_std
-            * self.model_args.vocab_size ** self.model_args.first_in_exp
+            * self.model_args.vocab_size**self.model_args.first_in_exp
         )
         if self.tok_embeddings is not None:
             if self.model_args.first_in_init_fn_type == "scion_normal":
@@ -662,7 +686,7 @@ class Transformer(nn.Module, ModelProtocol):
         final_out_init_fn = build_init_fn(self.model_args.final_out_init_fn_type)
         final_out_std = (
             self.model_args.final_out_init_std
-            * self.model_args.dim ** self.model_args.final_out_exp
+            * self.model_args.dim**self.model_args.final_out_exp
         )
         cutoff_factor = 3
         if self.output is not None:
@@ -728,9 +752,9 @@ class Transformer(nn.Module, ModelProtocol):
             for gate in gates_to_update:
                 experts = gate.experts
                 gate._accumulated_adjustment = all_local_counts[
-                    start_idx:start_idx + experts
+                    start_idx : start_idx + experts
                 ].clone()
-                gate.needs_reduction = False  # Mark as reduced
+                gate.needs_reduction.fill_(False)  # Mark as reduced
                 start_idx += experts
 
         for layer in self.layers.values():
