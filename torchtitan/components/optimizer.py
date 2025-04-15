@@ -29,6 +29,7 @@ from torchtitan.optimizers import (
     DistributedMuonV2,
     Muon,
     Scion,
+    DistributedScion,
 )
 from torchtitan.optimizers.muon_utils import gather_full_grad, zeropower_backends
 
@@ -113,6 +114,7 @@ def _extract_param_groups(
         }
         assert len(group_params["params"]) == len(group_params["param_names"])
         group_params.update(param_group_config)
+        group_params.pop("param_groups_config", None)
         params.append(group_params)
 
     param_names = list(param_dict.keys())
@@ -166,6 +168,7 @@ class OptimizersContainer(Optimizer, Generic[T]):
         self.optimizers: List[T] = []
         self.model_parts = model_parts
         param_groups_config = optimizer_kwargs.get("param_groups", None)
+
         for model in self.model_parts:
             # copy parts we will pop from to preserve settings across model parts
             kwargs = optimizer_kwargs.copy()
@@ -184,11 +187,12 @@ class OptimizersContainer(Optimizer, Generic[T]):
                 optimizer_cls,
                 (Muon, DistributedMuon, DistributedMuonV2),
             )
-            is_scion = issubclass(optimizer_cls, Scion)
+            is_scion = issubclass(optimizer_cls, (Scion, DistributedScion))
             if is_muon:
                 extra_kwargs.setdefault("model", model)
             if is_muon or is_scion:
                 kwargs.update(extra_kwargs)
+                kwargs.pop("param_groups_config", None)
             self.optimizers.append(optimizer_cls(params, **kwargs))
             all_params.extend(params)
         self._validate_length(len(self.model_parts))
@@ -234,7 +238,7 @@ class OptimizersContainer(Optimizer, Generic[T]):
 
     @staticmethod
     def compute_grad(p, optimizer=None, **kwargs):
-        if isinstance(optimizer, Scion):
+        if isinstance(optimizer, (Scion, DistributedScion)):
             g = p.grad
             if g is None or not p.requires_grad:
                 return None
@@ -298,7 +302,7 @@ class OptimizersContainer(Optimizer, Generic[T]):
             # NB: assumes correspondences between model parts and optimizers
             optimizer = self.optimizers[i]
             for group in optimizer.param_groups:
-                if isinstance(optimizer, Scion):
+                if isinstance(optimizer, (Scion, DistributedScion)):
                     param_kwargs = {
                         "momentum": group["momentum"],
                         "nesterov": group["nesterov"],
@@ -539,6 +543,7 @@ def build_optimizers(
         "Muon",
         "DistributedMuon",
         "DistributedMuonV2",
+        "DistributedMuonEP",
     ]:
         optim_implementation = job_config.optimizer.implementation
         assert optim_implementation in ["fused", "foreach", "for-loop"]
@@ -549,7 +554,11 @@ def build_optimizers(
         mesh_dim_names = extra_kwargs["world_mesh"].mesh_dim_names
         ep_enable = "dp_shard_1" in mesh_dim_names or "dp_shard_2" in mesh_dim_names
         if ep_enable:
-            fused = False
+            fused, foreach = False, False
+            """
+            Becase for Expert Parallel, We have two differnt device mesh
+            """
+
         width_multiplier = job_config.model.mup_width_multiplier
         # TODO Remove this deprecation handling at some point. Added on 2025-04-10.
         if "-multiplier-" in job_config.model.flavor:
@@ -569,7 +578,7 @@ def build_optimizers(
             "fused": fused,
             "foreach": foreach,
         }
-    elif name == "Scion":
+    elif name == "Scion" or name == "DistributedScion":
         backend_steps = job_config.optimizer.backend_steps
         momentum = job_config.optimizer.momentum
         nesterov = job_config.optimizer.nesterov
@@ -593,13 +602,14 @@ def build_optimizers(
     # Configure parameter group settings
     embed_lr = job_config.optimizer.embed_lr
     embed_str_match = job_config.optimizer.embed_str_match
+    param_groups_config = []
     if embed_lr is not None and embed_str_match:
         param_groups_config = optimizer_kwargs.setdefault("param_groups", [])
         param_group_config = {
             "param_str_match": embed_str_match,
             "lr": embed_lr,
         }
-        if name == "Scion":
+        if name == "Scion" or name == "DistributedScion":
             param_group_config["norm_factor"] = "embed_sqrt"
             param_group_config["backend"] = "identity"
         param_groups_config.append(param_group_config)
@@ -611,12 +621,13 @@ def build_optimizers(
             "param_str_match": unembed_str_match,
             "lr": unembed_lr / width_multiplier,
         }
-        if name == "Scion":
+        if name == "Scion" or name == "DistributedScion":
             param_group_config["norm_factor"] = "unembed_sqrt"
             param_group_config["backend"] = "identity"
         param_groups_config.append(param_group_config)
 
     optimizer_kwargs["extra_kwargs"] = extra_kwargs
+    optimizer_kwargs["param_groups_config"] = param_groups_config
 
     optimizer_classes = {
         "Adam": torch.optim.Adam,
@@ -625,6 +636,7 @@ def build_optimizers(
         "DistributedMuon": DistributedMuon,
         "DistributedMuonV2": DistributedMuonV2,
         "Scion": Scion,
+        "DistributedScion": DistributedScion,
     }
     if name not in optimizer_classes:
         raise NotImplementedError(f"Optimizer {name} not added.")

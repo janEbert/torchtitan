@@ -241,7 +241,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         logger.info(
             f"{color.blue}Model {self.train_spec.name} {job_config.model.flavor} "
-            f"{color.red}size: {model_param_count:,} total parameters{color.reset}"
+            f"{color.red}size: {activate_params:,} total parameters {model_param_count:,}"
+            f"{color.reset}"
         )
 
         # move sharded model to CPU/GPU and initialize weights via DTensor
@@ -475,14 +476,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if hasattr(model, "update_gate_bias"):
                 model.update_gate_bias()
 
-        # # TODO(JSC): if we shard the MoE model, we need to remove the following code
-        for model in model_parts:
-            for p_name, p in model.named_parameters():
-                if p.grad is None:
-                    raise Exception(f"p_name: {p_name} and p.grad is None")
-
         grad_norm = None
         # TODO(JSC): disable gradient clipping for now for debugging
+        # Adamw + EP seems does not work with gradient clipping
         if self.job_config.training.max_norm > 0:
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in model_parts for p in m.parameters()],
