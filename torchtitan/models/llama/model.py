@@ -72,18 +72,18 @@ class TransformerModelArgs(BaseModelArgs):
 
     def update_from_config(self, job_config: JobConfig, tokenizer: Tokenizer) -> None:
         for name in [
-                "first_in_init_fn_type",
-                "first_in_init_std",
-                "first_in_exp",
-                "intermediate_init_fn_type",
-                "intermediate_init_std",
-                "intermediate_exp",
-                "init_gate_as_residual",
-                "final_out_init_fn_type",
-                "final_out_init_std",
-                "final_out_exp",
-                "norm_type",
-                "use_flex_attn",
+            "first_in_init_fn_type",
+            "first_in_init_std",
+            "first_in_exp",
+            "intermediate_init_fn_type",
+            "intermediate_init_std",
+            "intermediate_exp",
+            "init_gate_as_residual",
+            "final_out_init_fn_type",
+            "final_out_init_std",
+            "final_out_exp",
+            "norm_type",
+            "use_flex_attn",
         ]:
             value = getattr(job_config.model, name)
             setattr(self, name, value)
@@ -91,8 +91,7 @@ class TransformerModelArgs(BaseModelArgs):
         if job_config.model.vocab_size_multiple_of:
             vocab_divisor = job_config.model.vocab_size_multiple_of
             self.vocab_size = int(
-                math.ceil(self.vocab_size / vocab_divisor)
-                * vocab_divisor
+                math.ceil(self.vocab_size / vocab_divisor) * vocab_divisor
             )
             logger.info(
                 f"Padded vocab size from {tokenizer.n_words} to {self.vocab_size}."
@@ -240,10 +239,10 @@ class KVCache(nn.Module):
     def update(self, start_pos, xk, xv):
         assert start_pos >= 0
         bsz, seqlen, _ = xk.shape
-        self.cache_k[:bsz, start_pos:start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos:start_pos + seqlen] = xv
-        xk = self.cache_k[:bsz, :start_pos + seqlen]
-        xv = self.cache_v[:bsz, :start_pos + seqlen]
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+        xk = self.cache_k[:bsz, : start_pos + seqlen]
+        xv = self.cache_v[:bsz, : start_pos + seqlen]
         return xk, xv
 
 
@@ -442,20 +441,16 @@ class FeedForward(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
     def init_weights(
-            self,
-            init_std: float,
-            residual_div: float,
-            init_gate_as_residual: bool,
-            init_fn_type: str,
+        self,
+        init_std: float,
+        residual_div: float,
+        init_gate_as_residual: bool,
+        init_fn_type: str,
     ):
         init_fn = build_init_fn(init_fn_type)
         init_fn(self.w1.weight, mean=0.0, std=init_std)
         init_fn(self.w2.weight, mean=0.0, std=init_std / residual_div)
-        gate_init_std = (
-            init_std / residual_div
-            if init_gate_as_residual
-            else init_std
-        )
+        gate_init_std = init_std / residual_div if init_gate_as_residual else init_std
         init_fn(self.w3.weight, mean=0.0, std=gate_init_std)
 
 
@@ -506,7 +501,7 @@ class TransformerBlock(nn.Module):
         self.weight_init_fn_type = model_args.intermediate_init_fn_type
         self.weight_init_std = (
             model_args.intermediate_init_std
-            * model_args.dim ** model_args.intermediate_exp
+            * model_args.dim**model_args.intermediate_exp
         )
         if model_args.depth_init:
             self.residual_div = (2 * (self.layer_id + 1)) ** 0.5
@@ -555,10 +550,10 @@ class TransformerBlock(nn.Module):
 
 class MTPModule(nn.Module):
     def __init__(
-            self,
-            layer_id: int,
-            model_args: TransformerModelArgs,
-            parent_transformer: nn.Module,
+        self,
+        layer_id: int,
+        model_args: TransformerModelArgs,
+        parent_transformer: nn.Module,
     ):
         super().__init__()
         self.parent_transformer = parent_transformer
@@ -577,7 +572,9 @@ class MTPModule(nn.Module):
 
     def init_weights(self):
         self.in_norm.reset_parameters()
-        init_fn = build_init_fn(self.parent_transformer.model_args.intermediate_init_fn_type)
+        init_fn = build_init_fn(
+            self.parent_transformer.model_args.intermediate_init_fn_type
+        )
         # Re-use block's init std.
         init_fn(self.mtp_proj.weight, mean=0.0, std=self.block.weight_init_std)
         self.block.init_weights()
@@ -651,7 +648,9 @@ class Transformer(nn.Module, ModelProtocol):
 
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(model_args.n_layers):
-            self.layers[str(layer_id)] = self.transformer_block_cls(layer_id, model_args)
+            self.layers[str(layer_id)] = self.transformer_block_cls(
+                layer_id, model_args
+            )
 
         self.norm = build_norm(
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
@@ -694,7 +693,7 @@ class Transformer(nn.Module, ModelProtocol):
         first_in_init_fn = build_init_fn(self.model_args.first_in_init_fn_type)
         first_in_std = (
             self.model_args.first_in_init_std
-            * self.model_args.vocab_size ** self.model_args.first_in_exp
+            * self.model_args.vocab_size**self.model_args.first_in_exp
         )
         if self.tok_embeddings is not None:
             if self.model_args.first_in_init_fn_type == "scion_normal":
@@ -716,7 +715,7 @@ class Transformer(nn.Module, ModelProtocol):
         final_out_init_fn = build_init_fn(self.model_args.final_out_init_fn_type)
         final_out_std = (
             self.model_args.final_out_init_std
-            * self.model_args.dim ** self.model_args.final_out_exp
+            * self.model_args.dim**self.model_args.final_out_exp
         )
         cutoff_factor = 3
         if self.output is not None:
@@ -804,7 +803,7 @@ class Transformer(nn.Module, ModelProtocol):
 
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = (
-            self.tok_embeddings(tokens[:, :self.model_args.max_seq_len])
+            self.tok_embeddings(tokens[:, : self.model_args.max_seq_len])
             if self.tok_embeddings
             else tokens
         )
@@ -825,11 +824,13 @@ class Transformer(nn.Module, ModelProtocol):
             if self.norm and prev_embed is None:
                 prev_embed = h
 
-            for (mtp_layer_id, mtp_layer) in self.mtp_layers.items():
+            for mtp_layer_id, mtp_layer in self.mtp_layers.items():
                 mtp_layer_id = int(mtp_layer_id)
                 token_offset = mtp_layer_id + 1
                 output, prev_embed = mtp_layer(
-                    orig_tokens[:, token_offset:token_offset + self.model_args.max_seq_len],
+                    orig_tokens[
+                        :, token_offset : token_offset + self.model_args.max_seq_len
+                    ],
                     prev_embed,
                 )
                 tokens_list[mtp_layer_id + 1] = output

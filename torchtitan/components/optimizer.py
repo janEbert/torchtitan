@@ -24,13 +24,7 @@ from torch.optim import Optimizer
 
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config_manager import JobConfig
-from torchtitan.optimizers import (
-    DistributedMuon,
-    DistributedMuonV2,
-    Muon,
-    Scion,
-    DistributedScion,
-)
+from torchtitan.optimizers import Scion, DistributedScion
 from torchtitan.optimizers.muon_utils import gather_full_grad, zeropower_backends
 
 __all__ = [
@@ -178,21 +172,12 @@ class OptimizersContainer(Optimizer, Generic[T]):
                     if param_groups_config is not None
                     else None
                 )
-
             extra_kwargs = kwargs.pop("extra_kwargs")
             params = _extract_param_groups(model, kwargs)
-
-            # For Muon, we need to pass the model as well
-            is_muon = issubclass(
-                optimizer_cls,
-                (Muon, DistributedMuon, DistributedMuonV2),
-            )
             is_scion = issubclass(optimizer_cls, (Scion, DistributedScion))
-            if is_muon:
-                extra_kwargs.setdefault("model", model)
-            if is_muon or is_scion:
+            if is_scion:
                 kwargs.update(extra_kwargs)
-                kwargs.pop("param_groups_config", None)
+            kwargs.pop("param_groups_config", None)
             self.optimizers.append(optimizer_cls(params, **kwargs))
             all_params.extend(params)
         self._validate_length(len(self.model_parts))
@@ -537,14 +522,7 @@ def build_optimizers(
     weight_decay = job_config.optimizer.weight_decay
 
     width_multiplier = 1
-    if name in [
-        "Adam",
-        "AdamW",
-        "Muon",
-        "DistributedMuon",
-        "DistributedMuonV2",
-        "DistributedMuonEP",
-    ]:
+    if name in ["Adam", "AdamW"]:
         optim_implementation = job_config.optimizer.implementation
         assert optim_implementation in ["fused", "foreach", "for-loop"]
 
@@ -554,10 +532,10 @@ def build_optimizers(
         mesh_dim_names = extra_kwargs["world_mesh"].mesh_dim_names
         ep_enable = "dp_shard_1" in mesh_dim_names or "dp_shard_2" in mesh_dim_names
         if ep_enable:
-            fused, foreach = False, False
             """
             Becase for Expert Parallel, We have two differnt device mesh
             """
+            fused, foreach = False, False
 
         width_multiplier = job_config.model.mup_width_multiplier
         # TODO Remove this deprecation handling at some point. Added on 2025-04-10.
@@ -632,9 +610,6 @@ def build_optimizers(
     optimizer_classes = {
         "Adam": torch.optim.Adam,
         "AdamW": torch.optim.AdamW,
-        "Muon": Muon,
-        "DistributedMuon": DistributedMuon,
-        "DistributedMuonV2": DistributedMuonV2,
         "Scion": Scion,
         "DistributedScion": DistributedScion,
     }

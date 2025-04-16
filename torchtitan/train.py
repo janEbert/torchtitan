@@ -476,9 +476,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if hasattr(model, "update_gate_bias"):
                 model.update_gate_bias()
 
-        grad_norm = None
+        # TODO(JSC): Scaled the EP's grad by 1/EP, we still need to scale expert's grad by 1/EP
+        # maybe we can move this to Expert Parallel as a grad hook[?] to make the
+        for model in model_parts:
+            for p_name, param in model.named_parameters():
+                if param.requires_grad and ".experts" in p_name:
+                    param.grad = param.grad / parallel_dims.ep
+
         # TODO(JSC): disable gradient clipping for now for debugging
         # Adamw + EP seems does not work with gradient clipping
+        grad_norm = None
         if self.job_config.training.max_norm > 0:
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in model_parts for p in m.parameters()],
@@ -529,11 +536,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     k: dist_utils.dist_mean(v, world_mesh["dp_cp"])
                     for (k, v) in moe_entropy_per_layer.items()
                 }
+                bias_list = []
+                for m_name, m in model_parts[0].named_modules():
+                    if "feed_forward.gate" in m_name and m.bias is not None:
+                        bias_list.append(m.bias)
+            else:
+                bias_list = None
 
         else:
             global_avg_loss = global_max_loss = loss.item()
 
         extra_log_data = {}
+
         if grad_norm is not None:
             extra_log_data["optim/grad_norm"] = grad_norm
         extra_log_data.update(self.optimizers.get_lrs())
@@ -546,7 +560,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             extra_log_data["loss_metrics/aux_loss"] = aux_loss
         if moe_entropy_per_layer is not None:
             for k, v in moe_entropy_per_layer.items():
-                extra_log_data[f"loss_metrics/moe_entropy_per_layer_{k}"] = v
+                extra_log_data[f"model/moe_entropy_per_layer_{k}"] = v
+        if bias_list is not None:
+            for bias_i in range(len(bias_list)):
+                extra_log_data[f"model/bias_{bias_i}"] = bias_list[bias_i].mean()
 
         color = self.metrics_processor.color
         extra_print_data = ""

@@ -21,15 +21,10 @@ from torchtitan.components.tokenizer import Tokenizer
 from torchtitan.config_manager import JobConfig
 from torchtitan.tools.logging import logger
 
-from .SeparateParamsGroupedExperts import SeparateParamsGroupedExperts
+
 from .GroupedExperts import GroupedExperts
 from . import ep_comm
 from .moe_utils import calc_gate_scaling_factor
-
-experts_impl_dict = {
-    "separate": SeparateParamsGroupedExperts,
-    "group": GroupedExperts,
-}
 
 
 @dataclass
@@ -79,13 +74,9 @@ class MoEModelArgs(BaseModelArgs):
     activate_experts: int = 0
     moe_gate_bias_update_speed: float = 0.001
     moe_aux_loss_alpha: float = 0.001
-    moe_routed_scaling_factor = (
-        None  # dpskv3 2.5, moonlight 2.446, set None to auto-compute
-    )
+    moe_routed_scaling_factor = None
+    # dpskv3 2.5, moonlight 2.446, set None to auto-compute
     moe_gate_use_bias_for_routing: bool = True
-    experts_impl: str = (
-        "group"  # "group" or "separate", separate-params works with muon for now
-    )
 
     def update_from_config(self, job_config: JobConfig, tokenizer: Tokenizer) -> None:
         for name in [
@@ -206,12 +197,17 @@ class Gate(nn.Module):
             scores: Expert selection scores
         """
         # Compute expert selection scores (sigmoid-based gating)
-        scores = x @ self.expert_embeddings.T
-        scores = torch.sigmoid(scores.to(torch.float32))
+
+        logits = torch.nn.functional.linear(
+            x.type(torch.float32), self.expert_embeddings.type(torch.float32)
+        )
+        scores = torch.sigmoid(logits)
 
         # Optionally add bias before top-k selection
         if self.bias is not None:
             biased_scores = scores + self.bias
+        else:
+            biased_scores = scores
 
         # Select top-k experts
         top_values, indices = torch.topk(biased_scores, self.topk, dim=-1)
@@ -325,7 +321,6 @@ class MoE(nn.Module):
         use_bias_for_routing: bool = True,
         bias_update_speed: float = 0.001,  # Bias adjustment speed
         aux_loss_alpha: float = 0.001,  # Small weight for sequence-wise auxiliary loss
-        experts_impl: str = "group",  # "group" or "separate"
         routed_scaling_factor: float = 1.0,
     ):
         super().__init__()
@@ -365,7 +360,6 @@ class MoE(nn.Module):
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        experts_impl_cls = experts_impl_dict[experts_impl]
         # Shared Experts (applies to all tokens)
         if n_shared_experts > 0:
             assert n_shared_experts == 1, "Only one shared expert is supported"
@@ -374,7 +368,7 @@ class MoE(nn.Module):
             To make Muon work easier, we set the shared experts to either 0 or 1.
             So we dont use the GroupedExperts.
             """
-            # self.shared_experts = experts_impl_cls(
+            # self.shared_experts = GroupedExperts(
             #     dim_in=dim, dim_out=hidden_dim, num_experts=n_shared_experts
             # )
             self.shared_experts = SharedExperts(dim, hidden_dim)
@@ -384,7 +378,7 @@ class MoE(nn.Module):
 
         # Routed Experts (only used when selected)
         if n_routed_experts > 0:
-            self.experts = experts_impl_cls(
+            self.experts = GroupedExperts(
                 dim_in=dim, dim_out=hidden_dim, num_experts=n_routed_experts
             )
 
@@ -595,7 +589,6 @@ class TransformerBlock(nn.Module):
             bias_update_speed=model_args.moe_gate_bias_update_speed,
             aux_loss_alpha=model_args.moe_aux_loss_alpha,
             match_dim_with_dense=True,
-            experts_impl=model_args.experts_impl,
             routed_scaling_factor=routed_scaling_factor,
         )
 
@@ -808,10 +801,7 @@ class Transformer(nn.Module, ModelProtocol):
         for layer in self.layers.values():
             if hasattr(layer.feed_forward, "gate"):
                 gate = layer.feed_forward.gate
-                if (
-                    gate._accumulated_adjustment is not None
-                    and gate._num_accumulated > 0
-                ):
+                if gate._num_accumulated > 0:
                     gates_to_update.append(gate)
                     accumulated_adjustments.append(gate._accumulated_adjustment)
 
