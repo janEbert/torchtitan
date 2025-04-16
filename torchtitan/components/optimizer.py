@@ -25,7 +25,7 @@ from torch.optim import Optimizer
 
 from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config_manager import JobConfig
-from torchtitan.optimizers import DistributedMuon, DistributedMuonV2, Muon, Scion
+from torchtitan.optimizers import DistributedMuon, DistributedMuonV2, DistributedScion, Muon, Scion
 from torchtitan.optimizers.muon_utils import gather_full_grad, zeropower_backends
 
 __all__ = [
@@ -173,7 +173,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
 
             # For Muon, we need to pass the model as well
             is_muon = issubclass(optimizer_cls, (Muon, DistributedMuon, DistributedMuonV2))
-            is_scion = issubclass(optimizer_cls, Scion)
+            is_scion = issubclass(optimizer_cls, (Scion, DistributedScion))
             if is_muon:
                 extra_kwargs.setdefault("model", model)
             if is_muon or is_scion:
@@ -223,7 +223,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
 
     @staticmethod
     def compute_grad(p, optimizer=None, **kwargs):
-        if isinstance(optimizer, Scion):
+        if isinstance(optimizer, (Scion, DistributedScion)):
             g = p.grad
             if g is None or not p.requires_grad:
                 return None
@@ -279,7 +279,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
             # NB: assumes correspondences between model parts and optimizers
             optimizer = self.optimizers[i]
             for group in optimizer.param_groups:
-                if isinstance(optimizer, Scion):
+                if isinstance(optimizer, (Scion, DistributedScion)):
                     param_kwargs = {
                         "momentum": group["momentum"],
                         "nesterov": group["nesterov"],
@@ -504,6 +504,8 @@ def build_optimizers(
     eps = job_config.optimizer.eps
     weight_decay = job_config.optimizer.weight_decay
 
+    is_scion = name == "Scion" or name == "DistributedScion"
+
     width_multiplier = 1
     if name in ["Adam", "AdamW", "Muon", "DistributedMuon", "DistributedMuonV2"]:
         optim_implementation = job_config.optimizer.implementation
@@ -536,7 +538,7 @@ def build_optimizers(
             "fused": fused,
             "foreach": foreach,
         }
-    elif name == "Scion":
+    elif is_scion:
         backend_steps = job_config.optimizer.backend_steps
         momentum = job_config.optimizer.momentum
         nesterov = job_config.optimizer.nesterov
@@ -566,7 +568,7 @@ def build_optimizers(
             "param_str_match": embed_str_match,
             "lr": embed_lr,
         }
-        if name == "Scion":
+        if is_scion:
             param_group_config["norm_factor"] = "embed_sqrt"
             param_group_config["backend"] = "identity"
         param_groups_config.append(param_group_config)
@@ -578,7 +580,7 @@ def build_optimizers(
             "param_str_match": unembed_str_match,
             "lr": unembed_lr / width_multiplier,
         }
-        if name == "Scion":
+        if is_scion:
             param_group_config["norm_factor"] = "unembed_sqrt"
             param_group_config["backend"] = "identity"
         param_groups_config.append(param_group_config)
@@ -592,6 +594,7 @@ def build_optimizers(
         "DistributedMuon": DistributedMuon,
         "DistributedMuonV2": DistributedMuonV2,
         "Scion": Scion,
+        "DistributedScion": DistributedScion,
     }
     if name not in optimizer_classes:
         raise NotImplementedError(f"Optimizer {name} not added.")
