@@ -40,6 +40,10 @@ if has_torchft:
 
 T = TypeVar("T", bound=Optimizer)
 
+@torch.no_grad()
+def condition_number(W):
+    assert W.ndim >= 2, "condition number can only be applied to matrices"
+    return torch.linalg.cond(W.to(torch.float32), p=2)
 
 @torch.no_grad()
 def spectral_norm(W):
@@ -75,6 +79,7 @@ NORM_FUNCTIONS = {
     "l1_to_rms": l1_to_rms_norm,
     "rms_to_l1": rms_to_l1_norm,
     "supremum": supremum_norm,
+    "condition_number": condition_number,
 }
 
 
