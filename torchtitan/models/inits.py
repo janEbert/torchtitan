@@ -31,6 +31,10 @@ def _wrap_ignore_generator(fn):
 
 def orthogonal_(param, gain: float = 1.0, generator: Optional[torch.Generator] = None):
     with torch.no_grad():
+        fan_out, fan_in = param.shape
+        scale = (fan_out / fan_in) ** 0.5
+        gain *= scale
+
         if not isinstance(param.data, DTensor):
             return nn.init.orthogonal_(param, gain=gain, generator=generator)
 
@@ -65,17 +69,28 @@ def scion_normal_(
         std: float = 1.0,
         norm_axis: int = 1,
         eps: float = 1e-12,
+        scale_type: Optional[str] = None,
         generator: Optional[torch.Generator] = None,
 ):
+    assert tensor.ndim == 2, "Tensor for scion_normal_ init must have 2 dimensions"
     nn.init.normal_(
         tensor,
         mean=mean,
         std=std,
         generator=generator,
     )
+    if scale_type is None:
+        scale = 1.0
+    elif scale_type == "input":
+        scale = tensor.shape[norm_axis] ** 0.5
+    elif scale_type == "output":
+        scale = tensor.shape[norm_axis] ** -0.5
+    else:
+        raise ValueError(f"Unknown scale_type: {scale_type}")
+    
     with torch.no_grad():
-        divisor = torch.rsqrt(tensor.pow(2).sum(axis=norm_axis, keepdim=True) + eps)
-        tensor.mul_(divisor)
+        scale = scale * torch.rsqrt(tensor.pow(2).sum(axis=norm_axis, keepdim=True) + eps)
+        tensor.mul_(scale)
 
 
 def build_init_fn(init_fn_type: str):
@@ -113,5 +128,17 @@ def build_init_fn(init_fn_type: str):
         return _wrap_orthogonal(orthogonal_)
     elif init_fn_type == "scion_normal":
         return scion_normal_
+    elif init_fn_type == "scion_normal_input":
+        return functools.partial(
+            scion_normal_,
+            scale_type="input",
+            norm_axis=1,
+        )
+    elif init_fn_type == "scion_normal_output": 
+        return functools.partial(
+            scion_normal_,
+            scale_type="output",
+            norm_axis=1,
+        )
     else:
         raise NotImplementedError(f"Unknown `init_fn_type`: '{init_fn_type}'")
