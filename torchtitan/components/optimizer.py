@@ -42,18 +42,23 @@ T = TypeVar("T", bound=Optimizer)
 
 @torch.no_grad()
 def condition_number(W):
-    assert W.ndim >= 2, "condition number can only be applied to matrices"
-    return torch.linalg.cond(W.to(torch.float32), p=2)
+    assert W.ndim == 2, "condition number can only be applied to matrices"
+    S = torch.linalg.svdvals(W.to(torch.float32), driver='gesvd')
+    return S[0]/S[-1]
 
 @torch.no_grad()
-def spectral_norm(W):
-    assert W.ndim >= 2, "operator norm can only be applied to matrices"
-    return torch.linalg.norm(W.to(torch.float32), ord=2, dtype=torch.float32)
+def rms_to_rms_norm(W):
+    assert W.ndim == 2, "operator norm can only be applied to matrices"
+    norm = torch.linalg.norm(W.to(torch.float32), ord=2, dtype=torch.float32)
+    fan_out, fan_in = W.shape
+    scale = (fan_in / fan_out) ** 0.5
+    norm *= scale
+    return norm 
 
 
 @torch.no_grad()
 def l1_to_rms_norm(W):
-    assert W.ndim >= 2, "operator norm can only be applied to matrices"
+    assert W.ndim == 2, "operator norm can only be applied to matrices"
     norm = torch.max(torch.linalg.norm(W.to(torch.float32), ord=2, dim=0, dtype=torch.float32))
     scale = torch.sqrt(torch.tensor(W.shape[0], dtype=W.dtype, device=W.device))
     norm /= scale
@@ -62,7 +67,7 @@ def l1_to_rms_norm(W):
 
 @torch.no_grad()
 def rms_to_l1_norm(W):
-    assert W.ndim >= 2, "operator norm can only be applied to matrices"
+    assert W.ndim == 2, "operator norm can only be applied to matrices"
     norm = torch.max(torch.linalg.norm(W.to(torch.float32), ord=2, dim=1, dtype=torch.float32))
     scale = torch.sqrt(torch.tensor(W.shape[1], dtype=W.dtype, device=W.device))
     norm *= scale
@@ -75,7 +80,7 @@ def supremum_norm(x):
 
 
 NORM_FUNCTIONS = {
-    "spectral": spectral_norm,
+    "rms_to_rms": rms_to_rms_norm,
     "l1_to_rms": l1_to_rms_norm,
     "rms_to_l1": rms_to_l1_norm,
     "supremum": supremum_norm,
