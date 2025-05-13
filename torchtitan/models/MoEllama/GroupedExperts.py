@@ -117,9 +117,10 @@ def init_all_experts_same(init_fn, w, init_std):
     else:
         local_tensor = w
 
-    # Initialize the local tensor
-    for e in range(local_tensor.shape[0]):
-        init_fn(local_tensor[e], mean=0.0, std=init_std)
+    init_fn(local_tensor[0], mean=0.0, std=init_std)
+    for e in range(1, local_tensor.shape[0]):
+        local_tensor[e].data.copy_(local_tensor[0].data)
+
     if isinstance(w, torch.distributed.tensor.DTensor):
         w.to_local().data = local_tensor
     else:
@@ -170,6 +171,6 @@ def init_all_experts_different(self, w, init_std):
             dtensor_matrix[e].data = data
 
     if isinstance(w, torch.distributed.tensor.DTensor):
-        w.to_local().data = dtensor_matrix
+        w.to_local().data.copy_(dtensor_matrix)
     else:
         w.copy_(dtensor_matrix)
