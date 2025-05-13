@@ -417,6 +417,11 @@ class JobConfig:
             help="String to match for unembedding layer parameter group",
         )
         self.parser.add_argument(
+            "--optimizer.gate_str_match",
+            type=str,
+            help="String to match for gate layer parameter group for MoE's",
+        )
+        self.parser.add_argument(
             "--optimizer.implementation",
             type=str,
             default="fused",

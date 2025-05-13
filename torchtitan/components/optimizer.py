@@ -139,6 +139,7 @@ def _extract_param_groups(
         group_params.update(param_group_config)
         params.append(group_params)
     param_names = list(param_dict.keys())
+
     params.insert(
         0,
         {
@@ -634,12 +635,24 @@ def build_optimizers(
         param_groups_config = optimizer_kwargs.setdefault("param_groups", [])
         param_group_config = {
             "param_str_match": unembed_str_match,
-            "lr": unembed_lr / width_multiplier,
+            "lr": unembed_lr,
         }
         if is_scion:
             param_group_config["norm_factor"] = "unembed_sqrt"
             param_group_config["backend"] = "identity"
         param_groups_config.append(param_group_config)
+
+    # gate_str_match = job_config.optimizer.gate_str_match
+    # if gate_str_match:
+    #     param_groups_config = optimizer_kwargs.setdefault("param_groups", [])
+    #     param_group_config = {
+    #         "param_str_match": gate_str_match,
+    #         "lr": lr,
+    #     }
+    #     if is_scion:
+    #         param_group_config["norm_factor"] = "unembed_sqrt"
+    #         param_group_config["backend"] = "identity"
+    #     param_groups_config.append(param_group_config)
 
     optimizer_kwargs["extra_kwargs"] = extra_kwargs
 
