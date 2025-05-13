@@ -141,8 +141,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # verify batch sizes
         if job_config.training.global_batch_size is None:
-            job_config.training.global_batch_size = \
+            job_config.training.global_batch_size = (
                 job_config.training.batch_size * dp_degree
+            )
         assert job_config.training.global_batch_size > 0
         assert (
             job_config.training.global_batch_size
@@ -154,9 +155,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"% ({job_config.training.batch_size} * {dp_degree}) != 0)"
         )
 
-        self.gradient_accumulation_steps = (
-            job_config.training.global_batch_size
-            // (job_config.training.batch_size * dp_degree)
+        self.gradient_accumulation_steps = job_config.training.global_batch_size // (
+            job_config.training.batch_size * dp_degree
         )
         assert self.gradient_accumulation_steps > 0
 
@@ -241,8 +241,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             )
 
         if job_config.training.num_mtp_tokens > 0:
-            assert self.train_spec.build_loss_fn is build_cross_entropy_loss, \
-                "MTP requires cross-entropy loss"
+            assert (
+                self.train_spec.build_loss_fn is build_cross_entropy_loss
+            ), "MTP requires cross-entropy loss"
             pre_mtp_loss_fn = self.loss_fn
             self.loss_fn = functools.partial(
                 multi_token_cross_entropy_loss,
@@ -372,12 +373,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
 
     def save_job_config(self):
-        if os.environ["RANK"] == '0':
+        if os.environ["RANK"] == "0":
             # Save job config to dump folder.
             os.makedirs(self.job_config.job.dump_folder, exist_ok=True)
             job_config_save_path = os.path.join(
                 self.job_config.job.dump_folder,
-                "job_config_" + datetime.datetime.now().strftime("%Y%m%d-%H%M") + ".json",
+                "job_config_"
+                + datetime.datetime.now().strftime("%Y%m%d-%H%M")
+                + ".json",
             )
             with open(job_config_save_path, "w") as f:
                 json.dump(self.job_config.to_dict(), f)
@@ -388,7 +391,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             os.makedirs(self.job_config.job.dump_folder, exist_ok=True)
             model_args_save_path = os.path.join(
                 self.job_config.job.dump_folder,
-                "model_args_" + datetime.datetime.now().strftime("%Y%m%d-%H%M") + ".json",
+                "model_args_"
+                + datetime.datetime.now().strftime("%Y%m%d-%H%M")
+                + ".json",
             )
             with open(model_args_save_path, "w") as f:
                 json.dump(vars(model_args), f)
@@ -435,7 +440,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if parallel_dims.pp_enabled:
             # Pipeline Parallel forward / backward inside step() call
-            with self.train_context(optional_context_parallel_ctx, self.activations_handling_ctx):
+            with self.train_context(
+                optional_context_parallel_ctx, self.activations_handling_ctx
+            ):
                 targets, losses = (
                     (labels, []) if self.pp_has_last_stage else (None, None)
                 )
@@ -477,7 +484,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         for microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = self.next_batch(data_iterator)
-            loss, aux_loss, moe_entropy_per_layer = self.batch_backward(input_dict, labels)
+            loss, aux_loss, moe_entropy_per_layer = self.batch_backward(
+                input_dict, labels
+            )
             self.metrics_processor.accumulated_losses.append(loss.detach())
             if aux_loss is not None:
                 self.metrics_processor.accumulated_aux_losses.append(aux_loss.detach())
@@ -516,7 +525,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         loss = torch.sum(torch.stack(self.metrics_processor.accumulated_losses))
         self.metrics_processor.accumulated_losses.clear()
         if len(self.metrics_processor.accumulated_aux_losses) > 0:
-            aux_loss = torch.sum(torch.stack(self.metrics_processor.accumulated_aux_losses))
+            aux_loss = torch.sum(
+                torch.stack(self.metrics_processor.accumulated_aux_losses)
+            )
             self.metrics_processor.accumulated_aux_losses.clear()
         if len(self.metrics_processor.accumulated_moe_entropy_per_layer) > 0:
             moe_entropy_per_layer = {}
@@ -562,9 +573,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if grad_norm is not None:
             extra_metrics["optim/grad_norm"] = grad_norm
         extra_metrics.update(self.optimizers.get_lrs())
-        if (
-                self.job_config.metrics.log_norm_freq > 0
-                and (self.step == 1 or self.step % self.job_config.metrics.log_norm_freq == 0)
+        if self.job_config.metrics.log_norm_freq > 0 and (
+            self.step == 1 or self.step % self.job_config.metrics.log_norm_freq == 0
         ):
             param_norms = self.optimizers.get_parameter_norms()
             extra_metrics.update(param_norms)
@@ -572,20 +582,22 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if aux_loss is not None:
             extra_metrics["loss_metrics/aux_loss"] = aux_loss
         if moe_entropy_per_layer is not None:
-            for (k, v) in moe_entropy_per_layer.items():
-                extra_metrics[f"loss_metrics/moe_entropy_per_layer_{k}"] = v
+            for k, v in moe_entropy_per_layer.items():
+                extra_metrics[f"moe_entropy/moe_entropy_per_layer_{k}"] = v
         if bias_list is not None:
             for bias_i in range(len(bias_list)):
-                extra_metrics[f"model/bias_{bias_i}"] = bias_list[bias_i].mean()
+                extra_metrics[f"moe_bias/bias_{bias_i}"] = bias_list[bias_i].mean()
 
         color = self.metrics_processor.color
         extra_print_data = ""
         if grad_norm is not None:
-            extra_print_data = (
-                f"{extra_print_data}  {color.green}gradnorm: {grad_norm:7.4f}{color.reset}"
-            )
+            extra_print_data = f"{extra_print_data}  {color.green}gradnorm: {grad_norm:7.4f}{color.reset}"
         self.metrics_processor.log(
-            self.step, global_avg_loss, global_max_loss, extra_metrics, extra_print_data,
+            self.step,
+            global_avg_loss,
+            global_max_loss,
+            extra_metrics,
+            extra_print_data,
         )
 
     @record
@@ -595,11 +607,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.checkpointer.load(step=job_config.checkpoint.load_step)
         logger.info(f"Training starts at step {self.step + 1}.")
 
-        with maybe_enable_profiling(
-            job_config, global_step=self.step
-        ) as torch_profiler, maybe_enable_memory_snapshot(
-            job_config, global_step=self.step
-        ) as memory_profiler:
+        with (
+            maybe_enable_profiling(job_config, global_step=self.step) as torch_profiler,
+            maybe_enable_memory_snapshot(
+                job_config, global_step=self.step
+            ) as memory_profiler,
+        ):
             data_iterator = iter(self.dataloader)
             while self.step < job_config.training.steps:
                 self.step += 1
