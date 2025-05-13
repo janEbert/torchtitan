@@ -361,7 +361,10 @@ class JobConfig:
             "--optimizer.eps", type=float, default=1e-8, help="Epsilon value to use"
         )
         self.parser.add_argument(
-            "--optimizer.weight_decay", type=float, default=0.1, help="Weight decay value to use"
+            "--optimizer.weight_decay",
+            type=float,
+            default=0.1,
+            help="Weight decay value to use",
         )
         self.parser.add_argument(
             "--optimizer.is_light",
@@ -374,13 +377,23 @@ class JobConfig:
             help="Whether to use Scion's unconstrained version",
         )
         self.parser.add_argument(
+            "--optimizer.zeropower_backend",
+            type=str,
+            default="newtonschulz5",
+            choices=["newtonschulz5", "svd"],
+            help="Which zeropower_backend to use",
+        )
+        self.parser.add_argument(
             "--optimizer.backend_steps",
             type=int,
             default=5,
             help="Number of steps for the Scion backend",
         )
         self.parser.add_argument(
-            "--optimizer.momentum", type=float, default=0.95, help="Scion momentum to use",
+            "--optimizer.momentum",
+            type=float,
+            default=0.95,
+            help="Scion momentum to use",
         )
         self.parser.add_argument(
             "--optimizer.nesterov",
@@ -472,7 +485,10 @@ class JobConfig:
 
         # training configs
         self.parser.add_argument(
-            "--training.dataset", type=string_list, default=["c4_test"], help="Dataset to use"
+            "--training.dataset",
+            type=string_list,
+            default=["c4_test"],
+            help="Dataset to use",
         )
         self.parser.add_argument(
             "--training.dataset_path",
@@ -522,7 +538,9 @@ class JobConfig:
                 packing. If not given, only mix in batch dimenison.""",
         )
         self.parser.add_argument(
-            "--training.dataset_inner_name", type=string_list, help="Dataset name to use"
+            "--training.dataset_inner_name",
+            type=string_list,
+            help="Dataset name to use",
         )
         self.parser.add_argument(
             "--training.dataset_files",
