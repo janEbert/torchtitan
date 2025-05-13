@@ -97,14 +97,18 @@ class DistributedScion(torch.optim.Optimizer):
         self.is_unconstrained = is_unconstrained
         self.world_mesh = world_mesh
         mesh_dim_names = world_mesh.mesh_dim_names
-        self.fsdp_enabled = (
-            "dp_shard" in mesh_dim_names or "dp_shard_1" in mesh_dim_names
-        )
-        self.expert_enabled = (
-            world_mesh is not None
-            and "dp_shard_1" in mesh_dim_names
-            and "dp_shard_0" in mesh_dim_names
-        )
+        try:
+            self.fsdp_enabled = (
+                "dp_shard" in mesh_dim_names or "dp_shard_1" in mesh_dim_names
+            )
+            self.expert_enabled = (
+                world_mesh is not None
+                and "dp_shard_1" in mesh_dim_names
+                and "dp_shard_0" in mesh_dim_names
+            )
+        except:
+            self.fsdp_enabled = False
+            self.expert_enabled = False
         print(
             f"Scion optimizer (is_light={self.is_light}, is_unconstrained={self.is_unconstrained}) "
             f"is enabled with world_mesh={world_mesh} | fsdp_enabled={self.fsdp_enabled} "
@@ -157,10 +161,9 @@ class DistributedScion(torch.optim.Optimizer):
                 param_kwargs = self.groups_info[self.paramters_to_groups[id(p)]][-1]
                 norm_factor = param_kwargs["norm_factor"]
                 backend = param_kwargs["zeropower_backend"]
-                is_embed_norm = (
-                    norm_factor.startswith("embed")
-                    or norm_factor.startswith("unembed")
-                )
+                is_embed_norm = norm_factor.startswith(
+                    "embed"
+                ) or norm_factor.startswith("unembed")
 
                 if (
                     backend is zeropower_backends["identity"]
@@ -294,7 +297,9 @@ class DistributedScion(torch.optim.Optimizer):
 
         for param_idx in range(len(sgd_params)):
             p = sgd_params[param_idx]
-            lr, nesterov, momentum, param_kwargs = self.groups_info[self.paramters_to_groups[id(p)]]
+            lr, nesterov, momentum, param_kwargs = self.groups_info[
+                self.paramters_to_groups[id(p)]
+            ]
             g = self.get_momentum_or_grad(
                 p, momentum, nesterov, update_buffer=True, gather_to_local=False
             )
