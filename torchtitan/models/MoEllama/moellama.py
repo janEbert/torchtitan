@@ -44,6 +44,7 @@ class MoEModelArgs(BaseModelArgs):
     # Exponent applied to the first input layer's input dimensionality
     # to obtain its init std factor.
     first_in_exp: float = 0.0
+    router_init_fn_type: str = "trunc_normal"
     intermediate_init_fn_type: str = "trunc_normal"
     intermediate_init_std: float = 0.02
     # Exponent applied to the model's hidden dimensionality to obtain
@@ -51,7 +52,6 @@ class MoEModelArgs(BaseModelArgs):
     intermediate_exp: float = 0.0
     # Whether to initialize the GLU gate as if it was a residual layer.
     init_gate_as_residual: bool = True
-    router_init_fn_type: str = "trunc_normal"
     final_out_init_fn_type: str = "trunc_normal"
     final_out_init_std: float = 1.0
     # Exponent applied to the final output layer's input dimensionality
@@ -83,6 +83,7 @@ class MoEModelArgs(BaseModelArgs):
             "first_in_init_fn_type",
             "first_in_init_std",
             "first_in_exp",
+            "router_init_fn_type",
             "intermediate_init_fn_type",
             "intermediate_init_std",
             "intermediate_exp",
@@ -200,9 +201,9 @@ class Gate(nn.Module):
         return f"Gate(experts={self.experts}, topk={self.topk}, bias={self.bias is not None})"
 
     def init_weights(self, init_std: float, init_fn_type: str):
-        nn.init.xavier_uniform_(self.expert_embeddings)
-        # init_fn = build_init_fn(init_fn_type)
-        # init_fn(self.expert_embeddings, mean=0.0, std=init_std)
+        # nn.init.xavier_uniform_(self.expert_embeddings)
+        init_fn = build_init_fn(init_fn_type)
+        init_fn(self.expert_embeddings, mean=0.0, std=init_std)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
 

@@ -241,6 +241,13 @@ class JobConfig:
                 to obtain its init std factor.""",
         )
         self.parser.add_argument(
+            "--model.router_init_fn_type",
+            type=str,
+            default="normal",
+            choices=INIT_FN_TYPES,
+            help="Weight initialization method to use for router layers.",
+        )
+        self.parser.add_argument(
             "--model.intermediate_init_fn_type",
             type=str,
             default="normal",

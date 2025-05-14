@@ -14,6 +14,7 @@ INIT_FN_TYPES = [
     "scion_normal",
     "scion_normal_input",
     "scion_normal_output",
+    "image_orthogonal",
 ]
 
 
@@ -46,7 +47,9 @@ def orthogonal_(param, gain: float = 1.0, generator: Optional[torch.Generator] =
         torch.nn.init.orthogonal_(temp_tensor, gain=gain, generator=generator)
 
         params_data = distribute_tensor(
-            temp_tensor, placements=param.placements, device_mesh=param.device_mesh,
+            temp_tensor,
+            placements=param.placements,
+            device_mesh=param.device_mesh,
         )
 
         # Copy values to original `DTensor`
@@ -54,7 +57,9 @@ def orthogonal_(param, gain: float = 1.0, generator: Optional[torch.Generator] =
         return param
 
 
-def scaled_orthogonal_(param, gain: float = 1.0, generator: Optional[torch.Generator] = None):
+def scaled_orthogonal_(
+    param, gain: float = 1.0, generator: Optional[torch.Generator] = None
+):
     """
     Note:
         Be aware that ``fan_in`` and ``fan_out`` are calculated assuming
@@ -65,8 +70,9 @@ def scaled_orthogonal_(param, gain: float = 1.0, generator: Optional[torch.Gener
         pass in a transposed weight matrix, i.e. ``nn.init.xavier_uniform_(w.T, ...)``.
     """
     with torch.no_grad():
-        assert param.ndim == 2, \
-            "Fan in and fan out can not be computed for tensor with other than 2 dimensions"
+        assert (
+            param.ndim == 2
+        ), "Fan in and fan out can not be computed for tensor with other than 2 dimensions"
         fan_out, fan_in = param.shape
         scale = math.sqrt(fan_out / fan_in)
         gain *= scale
@@ -74,14 +80,28 @@ def scaled_orthogonal_(param, gain: float = 1.0, generator: Optional[torch.Gener
     return orthogonal_(param, gain, generator)
 
 
+def image_orthogonal_(
+    param, gain: float = 1.0, generator: Optional[torch.Generator] = None
+):
+    with torch.no_grad():
+        assert (
+            param.ndim == 2
+        ), "Fan in and fan out can not be computed for tensor with other than 2 dimensions"
+        fan_out, fan_in = param.shape
+        scale = max(math.sqrt(fan_out / fan_in), 1.0)
+        gain *= scale
+
+    return orthogonal_(param, gain, generator)
+
+
 def scion_normal_(
-        tensor,
-        mean: float = 0.0,
-        std: float = 1.0,
-        norm_axis: int = 1,
-        eps: float = 1e-12,
-        scale_type: Optional[str] = None,
-        generator: Optional[torch.Generator] = None,
+    tensor,
+    mean: float = 0.0,
+    std: float = 1.0,
+    norm_axis: int = 1,
+    eps: float = 1e-12,
+    scale_type: Optional[str] = None,
+    generator: Optional[torch.Generator] = None,
 ):
     assert tensor.ndim == 2, "Tensor for scion_normal_ init must have 2 dimensions"
     nn.init.normal_(
@@ -100,7 +120,9 @@ def scion_normal_(
         raise ValueError(f"Unknown scale_type: {scale_type}")
 
     with torch.no_grad():
-        scale = scale / (torch.sqrt(tensor.pow(2).sum(axis=norm_axis, keepdim=True)) + eps)
+        scale = scale / (
+            torch.sqrt(tensor.pow(2).sum(axis=norm_axis, keepdim=True)) + eps
+        )
         tensor.mul_(scale)
 
 
@@ -138,6 +160,8 @@ def build_init_fn(init_fn_type: str):
         return _wrap_orthogonal(orthogonal_)
     elif init_fn_type == "scaled_orthogonal":
         return _wrap_orthogonal(scaled_orthogonal_)
+    elif init_fn_type == "image_orthogonal":
+        return _wrap_orthogonal(image_orthogonal_)
     elif init_fn_type == "scion_normal":
         return scion_normal_
     elif init_fn_type == "scion_normal_input":
