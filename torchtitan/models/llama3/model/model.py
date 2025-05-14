@@ -742,6 +742,9 @@ class Transformer(nn.Module, ModelProtocol):
             init_attention_mask(
                 input_batch,
                 eos_id=eos_id,
+                # Assume we'll never use padding if its token ID is
+                # negative.
+                pad_id=self.pad_id if self.pad_id >= 0 else None,
                 start_pos=start_pos,
             )
         elif start_pos >= 0:
