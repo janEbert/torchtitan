@@ -77,7 +77,7 @@ class GroupedExperts(nn.Module):
             torch.Tensor: with shape (experts_per_rank, tokens_per_expert, dim_in) for Expert Choice(EC).
         """
 
-        if isinstance(self.gate_proj, torch.distributed.tensor.DTensor):
+        if self.ep_local_rank is not None and self.ep_local_rank > 0:
             h = self.act_fn(torch.bmm(x, self.gate_proj.to_local()))
             h = h * torch.bmm(x, self.down_proj.to_local())
             out = torch.bmm(h, self.up_proj.to_local())
@@ -122,9 +122,9 @@ def init_all_experts_same(init_fn, w, init_std):
         local_tensor[e].data.copy_(local_tensor[0].data)
 
     if isinstance(w, torch.distributed.tensor.DTensor):
-        w.to_local().data = local_tensor
-    else:
         w.to_local().copy_(local_tensor)
+    else:
+        w.copy_(local_tensor)
 
 
 def init_all_experts_different(init_fn, w, init_std):

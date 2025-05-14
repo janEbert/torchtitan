@@ -71,12 +71,12 @@ class MoEModelArgs(BaseModelArgs):
     n_shared_experts: int = 1
     n_routed_experts: int = 0
     activate_experts: int = 0
-    moe_gate_bias_update_speed: float = 0.001
-    moe_aux_loss_alpha: float = 0.001
+    moe_gate_bias_update_speed: float = 0.001  # dpskv3, 0.001
+    moe_aux_loss_alpha: float = 0  # OLMoE, default 0.01
     moe_routed_scaling_factor = None
     # dpskv3 2.5, moonlight 2.446, set None to auto-compute
     moe_gate_use_bias_for_routing: bool = True
-    moe_init_all_experts_same: bool = False
+    moe_init_all_experts_same: bool = True
 
     def update_from_config(self, job_config: JobConfig, tokenizer: Tokenizer) -> None:
         for name in [
@@ -499,7 +499,10 @@ class MoE(nn.Module):
             aux_loss = torch.tensor(0.0, device=x.device)
 
         if self.topk > 0:
-            routing_entropy = -(weights * weights.log()).sum(dim=-1).mean()
+            correct_weights = weights.detach() / self.gate.routed_scaling_factor
+            routing_entropy = (
+                -(correct_weights * correct_weights.log()).sum(dim=-1).mean()
+            )
         else:
             routing_entropy = torch.tensor(0.0, device=x.device)
 
@@ -890,6 +893,7 @@ class Transformer(nn.Module, ModelProtocol):
     def update_gate_bias(self):
         gates_to_update = []
         accumulated_adjustments = []
+        token_selection_paer_layer = []
 
         for layer in self.layers.values():
             if hasattr(layer.feed_forward, "gate"):
@@ -917,7 +921,10 @@ class Transformer(nn.Module, ModelProtocol):
 
         for layer in self.layers.values():
             if hasattr(layer, "update_gate_bias"):
+                counts = layer.feed_forward.gate._accumulated_adjustment.cpu().tolist()
+                token_selection_paer_layer.append((layer.layer_id, counts))
                 layer.update_gate_bias()
+        return token_selection_paer_layer
 
     def get_sparsity_ratio(self):
         # we assume all layers have the same number of activated and routed experts
