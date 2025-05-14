@@ -18,7 +18,7 @@ from torch.optim.optimizer import (
 
 def zeropower_via_svd(G, **kwargs):
     original_dtype = G.dtype
-    G = G.to(torch.float16)
+    G = G.to(torch.float32)
     # SVD does not support bfloat16
     if G.size(0) > G.size(1):
         G = G.T
