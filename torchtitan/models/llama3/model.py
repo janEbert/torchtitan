@@ -271,7 +271,7 @@ class KVCache(nn.Module):
 
     def update(self, start_pos, xk, xv):
         assert start_pos >= 0
-        bsz, seqlen, _ = xk.shape
+        bsz, seqlen, _, _ = xk.shape
         self.cache_k[:bsz, start_pos:start_pos + seqlen] = xk
         self.cache_v[:bsz, start_pos:start_pos + seqlen] = xv
         xk = self.cache_k[:bsz, :start_pos + seqlen]
@@ -884,6 +884,7 @@ class Transformer(nn.Module, ModelProtocol):
         )
 
         if start_pos >= 0:
+            # TODO fix freqs_cis with left-padding
             freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
         else:
             freqs_cis = self.freqs_cis

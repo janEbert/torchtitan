@@ -57,12 +57,25 @@ class FlexAttention(torch.nn.Module):
         return causal_mask
 
     @staticmethod
-    def _get_padded_causal_mask_fn(batch: torch.Tensor, pad_id: int) -> Callable:
+    def _get_padded_causal_mask_fn(batch: torch.Tensor, start_pos: int, pad_id: int) -> Callable:
         # batch is [b, s, h, d] shape
         mask = batch != pad_id
+        q_offset = 0
+        if start_pos > 0:
+            mask = torch.hstack([
+                torch.zeros(
+                    (mask.shape[0], start_pos + 1 - mask.shape[1]) + mask.shape[2:],
+                    dtype=mask.dtype,
+                    device=mask.device,
+                ),
+                mask,
+            ])
+            # seqlen
+            if batch.shape[1] < mask.shape[1]:
+                q_offset = start_pos
 
         def padded_causal_mask(b, h, q_idx, kv_idx):
-            return mask[b, q_idx] & mask[b, kv_idx] & (q_idx >= kv_idx)
+            return mask[b, q_idx + q_offset] & mask[b, kv_idx] & (q_idx + q_offset >= kv_idx)
 
         return padded_causal_mask
 
@@ -132,6 +145,7 @@ class FlexAttention(torch.nn.Module):
                     batch_dimension = 1
                     if use_cached_mask:
                         if use_padded_mask:
+                            batch_dimension = batch.shape[0]
                             mask_fn = FlexAttention._get_cached_padded_causal_mask_fn(
                                 batch,
                                 start_pos,
@@ -141,7 +155,12 @@ class FlexAttention(torch.nn.Module):
                             mask_fn = FlexAttention._get_cached_causal_mask_fn(start_pos)
                     else:
                         if use_padded_mask:
-                            mask_fn = FlexAttention._get_padded_causal_mask_fn(batch, pad_id)
+                            batch_dimension = batch.shape[0]
+                            mask_fn = FlexAttention._get_padded_causal_mask_fn(
+                                batch,
+                                start_pos,
+                                pad_id,
+                            )
                         else:
                             mask_fn = FlexAttention._get_causal_mask_fn()
                 case "block_causal":
@@ -167,7 +186,7 @@ class FlexAttention(torch.nn.Module):
                 batch_dimension,
                 None,
                 seq_len,
-                seq_len,
+                seq_len + max(start_pos, 0),
             )
             FlexAttention.block_masks[attn_mask_type] = block_mask
 
