@@ -77,7 +77,7 @@ class GroupedExperts(nn.Module):
             torch.Tensor: with shape (experts_per_rank, tokens_per_expert, dim_in) for Expert Choice(EC).
         """
 
-        if self.ep_local_rank is not None and self.ep_local_rank > 0:
+        if isinstance(self.gate_proj, torch.distributed.tensor.DTensor):
             h = self.act_fn(torch.bmm(x, self.gate_proj.to_local()))
             h = h * torch.bmm(x, self.down_proj.to_local())
             out = torch.bmm(h, self.up_proj.to_local())

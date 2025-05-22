@@ -132,6 +132,12 @@ def parallelize_llama(
                 dp_mod_ep_mesh_dim_names.append("dp_replicate")
             dp_mod_ep_mesh_dim_names.append("dp_shard_1")
 
+        # TODO(JSC): need to check EP's scale factor if TP is enabled
+        assert parallel_dims.tp == 1
+
+        ep_enabled = parallel_dims.ep_mode == "naive_dp2ep" and parallel_dims.ep_enabled
+
+        loss_average_denominator = parallel_dims.loss_average_denominator
         apply_fsdp(
             model,
             world_mesh[tuple(dp_mesh_dim_names)],
@@ -140,8 +146,9 @@ def parallelize_llama(
             pp_enabled=parallel_dims.pp_enabled,
             cpu_offload=job_config.training.enable_cpu_offload,
             reshard_after_forward_policy=job_config.parallelism.fsdp_reshard_after_forward,
-            ep_enabled=parallel_dims.ep_mode == "naive_dp2ep" and parallel_dims.ep_enabled,
+            ep_enabled=ep_enabled,
             dp_mod_ep_mesh=world_mesh[tuple(dp_mod_ep_mesh_dim_names)],
+            loss_average_denominator=loss_average_denominator,
         )
 
         if parallel_dims.dp_replicate_enabled:
@@ -243,10 +250,12 @@ def apply_tp(
             "feed_forward.w3": colwise_parallel(),
         }
         if isinstance(transformer_block, BitNetTransformerBlock):
-            layer_plan.update({
-                "attention.wo_norm": SequenceParallel(),
-                "feed_forward.w2_norm": SequenceParallel(),
-            })
+            layer_plan.update(
+                {
+                    "attention.wo_norm": SequenceParallel(),
+                    "feed_forward.w2_norm": SequenceParallel(),
+                }
+            )
 
         parallelize_module(
             module=transformer_block,
@@ -345,16 +354,21 @@ def _apply_ac_to_transformer_block(module: nn.Module, ac_config):
             CheckpointPolicy,
             create_selective_checkpoint_contexts,
         )
+
         if isinstance(module, BitNetTransformerBlock):
-            _save_list.update({
-                torch.ops.torchao.scaled_int8_mm.default,
-                torch.ops.aten._int_mm.default,
-                torch.ops.aten.mean.default,
-            })
-            mm_funs.extend([
-                torch.ops.torchao.scaled_int8_mm.default,
-                torch.ops.aten._int_mm.default,
-            ])
+            _save_list.update(
+                {
+                    torch.ops.torchao.scaled_int8_mm.default,
+                    torch.ops.aten._int_mm.default,
+                    torch.ops.aten.mean.default,
+                }
+            )
+            mm_funs.extend(
+                [
+                    torch.ops.torchao.scaled_int8_mm.default,
+                    torch.ops.aten._int_mm.default,
+                ]
+            )
 
         def _get_custom_policy(meta):
             def _custom_policy(ctx, func, *args, **kwargs):
@@ -425,6 +439,7 @@ def apply_fsdp(
     reshard_after_forward_policy: str = "default",
     ep_enabled: bool = False,
     dp_mod_ep_mesh: DeviceMesh | None = None,
+    loss_average_denominator: int = 1,
 ):
     """
     Apply data parallelism (via FSDP2) to the model.
@@ -476,6 +491,9 @@ def apply_fsdp(
                 reshard_after_forward=reshard_after_forward,
             )
 
+            transformer_block.feed_forward.experts.set_reduce_scatter_divide_factor(
+                loss_average_denominator
+            )
         fully_shard(
             transformer_block,
             **fsdp_config,

@@ -441,7 +441,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if parallel_dims.pp_enabled:
             # Pipeline Parallel forward / backward inside step() call
             with self.train_context(
-                optional_context_parallel_ctx, self.activations_handling_ctx
+                optional_context_parallel_ctx,
+                # self.activations_handling_ctx
             ):
                 targets, losses = (
                     (labels, []) if self.pp_has_last_stage else (None, None)
@@ -460,7 +461,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             )
         else:
             # Non-PP forward / backward
-            with self.train_context(optional_context_parallel_ctx):
+            with self.train_context(
+                optional_context_parallel_ctx,
+                # self.activations_handling_ctx
+            ):
                 assert len(model_parts) == 1
                 pred = model_parts[0](inputs)
 
@@ -501,14 +505,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if hasattr(model, "update_gate_bias"):
                 token_selection_paer_layer = model.update_gate_bias()
 
-        # TODO(JSC): Scaled the EP's grad by 1/EP, we still need to scale expert's grad by 1/EP
-        # maybe we can move this to Expert Parallel as a grad hook[?] to make the
-        for model in model_parts:
-            for p_name, param in model.named_parameters():
-                if param.requires_grad and ".experts" in p_name:
-                    param.grad = param.grad / parallel_dims.ep
-
-        # TODO(JSC): disable gradient clipping for now for debugging
         # Adamw + EP seems does not work with gradient clipping
         grad_norm = None
         if self.job_config.training.max_norm > 0:
