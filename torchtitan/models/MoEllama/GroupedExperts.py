@@ -8,6 +8,7 @@ from . import ep_comm
 from torchtitan.models.inits import build_init_fn
 import torch.distributed as dist
 import random
+from torchtitan.models.norms import build_norm
 
 
 class GroupedExperts(nn.Module):
@@ -35,6 +36,9 @@ class GroupedExperts(nn.Module):
         num_experts: int = 1,
         activation: Callable = F.silu,
         moe_init_all_experts_same: bool = False,
+        norm_everywhere: bool = False,
+        norm_type: str = "np_rmsnorm",
+        norm_eps: float = 1e-5,
     ):
         super().__init__()
         self.dim_in = dim_in
@@ -50,12 +54,18 @@ class GroupedExperts(nn.Module):
 
         self.init_all_experts_same = moe_init_all_experts_same
 
+        if norm_everywhere:
+            self.out_norm = build_norm(norm_type, dim=dim_in, eps=norm_eps)
+        else:
+            self.out_norm = nn.Identity()
+
     def __repr__(self):
         model_str = f"GroupedExperts(dim_in={self.dim_in}, dim_hidden={self.dim_out},\n"
         model_str += f"\tnum_experts={self.num_experts}, local_experts={self.expert_per_rank}, ep_size={self.ep_size}\n"
         model_str += f"\tgate_proj={self.gate_proj.shape}, \n"
         model_str += f"\tdown_proj={self.down_proj.shape}, \n"
         model_str += f"\tup_proj={self.up_proj.shape}, \n"
+        model_str += f"\tout_norm={self.out_norm}, \n"
         model_str += ")"
         return model_str
 
@@ -80,11 +90,13 @@ class GroupedExperts(nn.Module):
         if isinstance(self.gate_proj, torch.distributed.tensor.DTensor):
             h = self.act_fn(torch.bmm(x, self.gate_proj.to_local()))
             h = h * torch.bmm(x, self.down_proj.to_local())
+            h = self.out_norm(h)
             out = torch.bmm(h, self.up_proj.to_local())
 
         else:
             h = self.act_fn(torch.bmm(x, self.gate_proj))
             h = h * torch.bmm(x, self.down_proj)
+            h = self.out_norm(h)
             out = torch.bmm(h, self.up_proj)
 
         return out

@@ -61,6 +61,7 @@ class TransformerModelArgs(BaseModelArgs):
     final_out_exp: float = -0.5
     norm_type: str = "rmsnorm"
     qk_norm: bool = False
+    norm_everywhere: bool = False
 
     use_flex_attn: bool = False
     attn_mask_type: str = "causal"
@@ -71,19 +72,19 @@ class TransformerModelArgs(BaseModelArgs):
 
     def update_from_config(self, job_config: JobConfig, tokenizer: Tokenizer) -> None:
         for name in [
-                "first_in_init_fn_type",
-                "first_in_init_std",
-                "first_in_exp",
-                "intermediate_init_fn_type",
-                "intermediate_init_std",
-                "intermediate_exp",
-                "init_gate_as_residual",
-                "final_out_init_fn_type",
-                "final_out_init_std",
-                "final_out_exp",
-                "norm_type",
-                "use_flex_attn",
-                "attn_mask_type",
+            "first_in_init_fn_type",
+            "first_in_init_std",
+            "first_in_exp",
+            "intermediate_init_fn_type",
+            "intermediate_init_std",
+            "intermediate_exp",
+            "init_gate_as_residual",
+            "final_out_init_fn_type",
+            "final_out_init_std",
+            "final_out_exp",
+            "norm_type",
+            "use_flex_attn",
+            "attn_mask_type",
         ]:
             value = getattr(job_config.model, name)
             setattr(self, name, value)
@@ -91,13 +92,13 @@ class TransformerModelArgs(BaseModelArgs):
         if job_config.model.vocab_size_multiple_of:
             vocab_divisor = job_config.model.vocab_size_multiple_of
             self.vocab_size = int(
-                math.ceil(self.vocab_size / vocab_divisor)
-                * vocab_divisor
+                math.ceil(self.vocab_size / vocab_divisor) * vocab_divisor
             )
             logger.info(
                 f"Padded vocab size from {tokenizer.n_words} to {self.vocab_size}."
             )
         self.max_seq_len = job_config.training.seq_len
+        self.qk_norm = self.qk_norm or self.norm_everywhere
 
     def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
         nparams_not_ffn = 0
@@ -135,7 +136,9 @@ class TransformerModelArgs(BaseModelArgs):
         #    but recomputation should not be counted in calculating MFU           (+0)
         # 3. each matmul performs 1 multiplication and 1 addition                 (*2)
         # 4. we follow the convention and do not account for sparsity in causal attention
-        num_flops_per_token = 6 * (nparams_active - nparams_embedding) + 12 * l * h * q * t
+        num_flops_per_token = (
+            6 * (nparams_active - nparams_embedding) + 12 * l * h * q * t
+        )
 
         return nparams_active, nparams_total, num_flops_per_token
 
@@ -248,10 +251,10 @@ class KVCache(nn.Module):
     def update(self, start_pos, xk, xv):
         assert start_pos >= 0
         bsz, seqlen, _ = xk.shape
-        self.cache_k[:bsz, start_pos:start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos:start_pos + seqlen] = xv
-        xk = self.cache_k[:bsz, :start_pos + seqlen]
-        xv = self.cache_v[:bsz, :start_pos + seqlen]
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+        xk = self.cache_k[:bsz, : start_pos + seqlen]
+        xv = self.cache_v[:bsz, : start_pos + seqlen]
         return xk, xv
 
 
@@ -297,7 +300,8 @@ class Attention(nn.Module):
 
         self._kv_cache: Optional[KVCache] = None
 
-        self.qk_norm = model_args.qk_norm
+        self.qk_norm = model_args.qk_norm or model_args.norm_everywhere
+        self.norm_everywhere = model_args.norm_everywhere
         if self.qk_norm:
             self.q_norm = build_norm(
                 model_args.norm_type,
@@ -305,6 +309,17 @@ class Attention(nn.Module):
                 eps=model_args.norm_eps,
             )
             self.k_norm = build_norm(
+                model_args.norm_type,
+                dim=self.head_dim,
+                eps=model_args.norm_eps,
+            )
+        if self.norm_everywhere:
+            self.o_norm = build_norm(
+                model_args.norm_type,
+                dim=model_args.dim,
+                eps=model_args.norm_eps,
+            )
+            self.v_norm = build_norm(
                 model_args.norm_type,
                 dim=self.head_dim,
                 eps=model_args.norm_eps,
@@ -360,6 +375,8 @@ class Attention(nn.Module):
         if self.qk_norm:
             xq = self.q_norm(xq)
             xk = self.k_norm(xk)
+        if self.norm_everywhere:
+            xv = self.v_norm(xv)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
@@ -380,6 +397,8 @@ class Attention(nn.Module):
             1, 2
         ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
         output = output.view(bs, seqlen, -1)
+        if self.norm_everywhere:
+            output = self.o_norm(output)
         return self.wo(output)
 
 
@@ -406,6 +425,9 @@ class FeedForward(nn.Module):
         hidden_dim: int,
         multiple_of: int,
         ffn_dim_multiplier: Optional[float],
+        norm_everywhere: bool = False,
+        norm_type: str = "np_rmsnorm",
+        norm_eps: float = 1e-5,
     ):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
@@ -418,24 +440,29 @@ class FeedForward(nn.Module):
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
+        if norm_everywhere:
+            self.out_norm = build_norm(
+                norm_type,
+                dim=hidden_dim,
+                eps=norm_eps,
+            )
+        else:
+            self.out_norm = nn.Identity()
+
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.w2(self.out_norm(F.silu(self.w1(x)) * self.w3(x)))
 
     def init_weights(
-            self,
-            init_std: float,
-            residual_div: float,
-            init_gate_as_residual: bool,
-            init_fn_type: str,
+        self,
+        init_std: float,
+        residual_div: float,
+        init_gate_as_residual: bool,
+        init_fn_type: str,
     ):
         init_fn = build_init_fn(init_fn_type)
         init_fn(self.w1.weight, mean=0.0, std=init_std)
         init_fn(self.w2.weight, mean=0.0, std=init_std / residual_div)
-        gate_init_std = (
-            init_std / residual_div
-            if init_gate_as_residual
-            else init_std
-        )
+        gate_init_std = init_std / residual_div if init_gate_as_residual else init_std
         init_fn(self.w3.weight, mean=0.0, std=gate_init_std)
 
 
@@ -472,6 +499,9 @@ class TransformerBlock(nn.Module):
             hidden_dim=4 * model_args.dim,
             multiple_of=model_args.multiple_of,
             ffn_dim_multiplier=model_args.ffn_dim_multiplier,
+            norm_everywhere=model_args.norm_everywhere,
+            norm_type=model_args.norm_type,
+            norm_eps=model_args.norm_eps,
         )
         self.layer_id = layer_id
         self.num_layers = model_args.n_layers
@@ -486,7 +516,7 @@ class TransformerBlock(nn.Module):
         self.weight_init_fn_type = model_args.intermediate_init_fn_type
         self.weight_init_std = (
             model_args.intermediate_init_std
-            * model_args.dim ** model_args.intermediate_exp
+            * model_args.dim**model_args.intermediate_exp
         )
         if model_args.depth_init is None:
             self.residual_div = 1.0
@@ -538,10 +568,10 @@ class TransformerBlock(nn.Module):
 
 class MTPModule(nn.Module):
     def __init__(
-            self,
-            layer_id: int,
-            model_args: TransformerModelArgs,
-            parent_transformer: nn.Module,
+        self,
+        layer_id: int,
+        model_args: TransformerModelArgs,
+        parent_transformer: nn.Module,
     ):
         super().__init__()
         self.parent_transformer = parent_transformer
@@ -560,7 +590,9 @@ class MTPModule(nn.Module):
 
     def init_weights(self):
         self.in_norm.reset_parameters()
-        init_fn = build_init_fn(self.parent_transformer.model_args.intermediate_init_fn_type)
+        init_fn = build_init_fn(
+            self.parent_transformer.model_args.intermediate_init_fn_type
+        )
         # Re-use block's init std.
         init_fn(self.mtp_proj.weight, mean=0.0, std=self.block.weight_init_std)
         self.block.init_weights()
@@ -635,7 +667,9 @@ class Transformer(nn.Module, ModelProtocol):
 
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(model_args.n_layers):
-            self.layers[str(layer_id)] = self.transformer_block_cls(layer_id, model_args)
+            self.layers[str(layer_id)] = self.transformer_block_cls(
+                layer_id, model_args
+            )
 
         self.norm = build_norm(
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
@@ -678,7 +712,7 @@ class Transformer(nn.Module, ModelProtocol):
         first_in_init_fn = build_init_fn(self.model_args.first_in_init_fn_type)
         first_in_std = (
             self.model_args.first_in_init_std
-            * self.model_args.vocab_size ** self.model_args.first_in_exp
+            * self.model_args.vocab_size**self.model_args.first_in_exp
         )
         if self.tok_embeddings is not None:
             if self.model_args.first_in_init_fn_type == "scion_normal":
@@ -700,7 +734,7 @@ class Transformer(nn.Module, ModelProtocol):
         final_out_init_fn = build_init_fn(self.model_args.final_out_init_fn_type)
         final_out_std = (
             self.model_args.final_out_init_std
-            * self.model_args.dim ** self.model_args.final_out_exp
+            * self.model_args.dim**self.model_args.final_out_exp
         )
         cutoff_factor = 3
         if self.output is not None:
@@ -792,19 +826,21 @@ class Transformer(nn.Module, ModelProtocol):
         if self.model_args.use_flex_attn:
             init_attention_mask(tokens, eos_id=self.eos_id, start_pos=start_pos)
         elif start_pos >= 0:
-            raise ValueError("`start_pos >= 0`, but cannot use caching without FlexAttention")
+            raise ValueError(
+                "`start_pos >= 0`, but cannot use caching without FlexAttention"
+            )
 
         seqlen = tokens.shape[1]
 
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = (
-            self.tok_embeddings(tokens[:, :self.model_args.max_seq_len])
+            self.tok_embeddings(tokens[:, : self.model_args.max_seq_len])
             if self.tok_embeddings
             else tokens
         )
 
         if start_pos >= 0:
-            freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
+            freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         else:
             freqs_cis = self.freqs_cis
         for layer in self.layers.values():
@@ -823,11 +859,13 @@ class Transformer(nn.Module, ModelProtocol):
             if self.norm and prev_embed is None:
                 prev_embed = h
 
-            for (mtp_layer_id, mtp_layer) in self.mtp_layers.items():
+            for mtp_layer_id, mtp_layer in self.mtp_layers.items():
                 mtp_layer_id = int(mtp_layer_id)
                 token_offset = mtp_layer_id + 1
                 output, prev_embed = mtp_layer(
-                    orig_tokens[:, token_offset:token_offset + self.model_args.max_seq_len],
+                    orig_tokens[
+                        :, token_offset : token_offset + self.model_args.max_seq_len
+                    ],
                     prev_embed,
                 )
                 tokens_list[mtp_layer_id + 1] = output
