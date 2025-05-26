@@ -60,6 +60,8 @@ def main(args_list: list[str] | None = None):
     prompts = ["This is "]
     # prompts = ["This is ", ""]
     # prompts = ["", "This is "]
+    # prompts = ["This is ", "Klar doch, "]
+    # prompts = ["Klar doch, ", "This is "]
     result_bytes = [[] for _ in range(len(prompts))]
     # start_pos = 0
     start_pos = -1
@@ -81,28 +83,33 @@ def main(args_list: list[str] | None = None):
                 TorchTitanServerRequestHandler.MAX_RECV_DATA_BYTES,
                 TorchTitanServerRequestHandler.DATA_BYTES_PER_PIECE,
             )
-            output_dict = decode_data(received)
-            start_pos = output_dict["next_start_pos"]
-            logger.debug(f"{output_dict = }")
-            if "output_tokens" not in output_dict:
-                raise RuntimeError(
-                    "server only returned logits; client-side sampling not implemented ATM",
-                )
-            seeds.append(output_dict["seed"])
-            for (i, (prefix, suffix, input_toks)) in enumerate(zip(
-                    result_bytes,
-                    output_dict["output_tokens"],
-                    output_dict["input_tokens"],
-            )):
-                if not prefix:
-                    prefix = input_toks
-                result_bytes[i] = prefix + suffix
-                # Switch from string input to raw bytes input to handle
-                # partial UTF-8.
-                # TODO bottom commented one works definitely; testing full prompt with start pos now
-                # This one probably has an error; isn't numerically
-                # equal unlike suffix-only case.
-                # prompts[i] = prefix + suffix
+
+        output_dict = decode_data(received)
+        start_pos = output_dict["next_start_pos"]
+        logger.debug(f"{output_dict = }")
+        # if i == 2:
+        #     break
+        if "output_tokens" not in output_dict:
+            raise RuntimeError(
+                "server only returned logits; client-side sampling not implemented ATM",
+            )
+        seeds.append(output_dict["seed"])
+        for (i, (prefix, suffix, input_toks)) in enumerate(zip(
+                result_bytes,
+                output_dict["output_tokens"],
+                output_dict["input_tokens"],
+        )):
+            if not prefix:
+                prefix = input_toks
+            result_bytes[i] = prefix + suffix
+            # Switch from string input to raw bytes input to handle
+            # partial UTF-8.
+            # TODO bottom commented one works definitely; testing full prompt with start pos now
+            # This one probably has an error; isn't numerically
+            # equal unlike suffix-only case.
+            if start_pos < 0:
+                prompts[i] = prefix + suffix
+            else:
                 prompts[i] = suffix
 
     tok = ByteTokenizer()
