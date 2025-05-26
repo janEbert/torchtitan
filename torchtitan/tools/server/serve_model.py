@@ -77,6 +77,19 @@ def parse_args(args_list: list[str] | None = None):
         help="Whether to sample instead of serving only raw logits.",
     )
 
+    parser.add_argument(
+        "--max_batch_size",
+        default=8,
+        type=int,
+        help="Maximum batch size that the KV cache can handle.",
+    )
+    parser.add_argument(
+        "--max_seq_length",
+        default=4096,
+        type=int,
+        help="Maximum sequence length the KV cache can handle.",
+    )
+
     if args_list is None:
         args_list = sys.argv[1:]
     args = parser.parse_args(args_list)
@@ -434,13 +447,19 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
 
 
 class TorchTitanServer(TCPServer):
-    def __init__(self, job_config: JobConfig, checkpoint_folder: str | None = None):
+    def __init__(
+            self,
+            job_config: JobConfig,
+            checkpoint_folder: str | None = None,
+            max_batch_size: int = 8,
+            max_seq_length: int = 4096,
+    ):
         super().__init__(
             ("localhost", DEFAULT_PORT),
             TorchTitanServerRequestHandler,
             bind_and_activate=False,
         )
-        self.init_model(job_config)
+        self.init_model(job_config, max_batch_size, max_seq_length)
         if checkpoint_folder:
             self.load_model(checkpoint_folder)
         self.is_serving = False
@@ -749,7 +768,7 @@ class TorchTitanServer(TCPServer):
 
         return pred
 
-    def init_model(self, job_config: JobConfig):
+    def init_model(self, job_config: JobConfig, max_batch_size: int, max_seq_length: int):
         self.job_config = job_config
 
         if job_config.experimental.custom_import:
@@ -804,6 +823,7 @@ class TorchTitanServer(TCPServer):
 
         with torch.device("meta"):
             model = model_cls.from_model_args(model_args)
+            model.init_kv_cache(max_batch_size, max_seq_length)
 
         logger.info(f"model: {model}")
 
@@ -1011,7 +1031,12 @@ def main(args_list: list[str] | None = None):
 
     server = None
     try:
-        server = TorchTitanServer(job_config, checkpoint_folder)
+        server = TorchTitanServer(
+            job_config,
+            checkpoint_folder,
+            args.max_batch_size,
+            args.max_seq_length,
+        )
         server.serve(args.server_address, args.server_port, logits_only=not args.do_sampling)
     finally:
         if server:
