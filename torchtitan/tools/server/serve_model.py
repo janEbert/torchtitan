@@ -153,7 +153,7 @@ def receive_data(request, max_recv_bytes, bytes_per_piece):
 
 def send_data(data, request, max_send_bytes, bytes_per_piece):
     if len(data) > max_send_bytes:
-        logger.warn(
+        logger.warning(
             f"truncating data to send from {len(data)} bytes to "
             f"{max_send_bytes} bytes "
             f"(-{len(data) - max_send_bytes} bytes)"
@@ -978,7 +978,7 @@ def main(args_list: list[str] | None = None):
             device_type == "cuda"
             and (device_props := torch.cuda.get_device_properties(device_type)).major < 7
         ):
-            logging.warn(
+            logging.warning(
                 f"Found {device_props.name} which is too old to be supported by the triton GPU "
                 f"compiler, which is used as the backend. Triton only supports devices of CUDA "
                 f"Capability >= 7.0, but your device is of CUDA capability "
@@ -986,7 +986,7 @@ def main(args_list: list[str] | None = None):
                 f"Disabling compilation..."
             )
         elif is_gpu(device_type):
-            logging.warn(
+            logging.warning(
                 "Cannot find a working triton installation. Either the package is not installed or "
                 "it is too old. More information on installing Triton can be found at "
                 "https://github.com/openai/triton"
