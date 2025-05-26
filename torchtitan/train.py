@@ -40,6 +40,7 @@ from torchtitan.tools.profiling import (
     maybe_enable_memory_snapshot,
     maybe_enable_profiling,
 )
+import toml
 
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
@@ -384,6 +385,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             )
             with open(job_config_save_path, "w") as f:
                 json.dump(self.job_config.to_dict(), f, indent=4)
+            with open(job_config_save_path.replace(".json", ".toml"), "w") as f:
+                toml.dump(self.job_config.to_dict(), f)
 
     def save_model_args(self, model_args: train_spec_module.BaseModelArgs):
         if torch.distributed.get_rank() == 0:
