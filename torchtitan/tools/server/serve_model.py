@@ -160,10 +160,14 @@ def send_data(data, request, max_send_bytes, bytes_per_piece):
         )
         data = data[:max_send_bytes]
     pieces = map(bytes, itertools.batched(data, n=bytes_per_piece))
-    for piece in pieces:
-        request.send(piece)
-    logger.debug(f"sent: {data}")
-    request.send(b"\n")
+    try:
+        for piece in pieces:
+            request.send(piece)
+        logger.debug(f"sent: {data}")
+        request.send(b"\n")
+        return True
+    except BrokenPipeError:
+        return False
 
 
 class TorchTitanServerRequestHandler(BaseRequestHandler):
