@@ -346,7 +346,6 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
             #      probably it works correctly if just setting start_pos
             #      as if without MTP...
             # next_start_pos = start_pos + input_dict["input"].size(1) + len(output_texts[0]) - 1
-            # TODO next start pos has to be minimal input seq len!
             if isinstance(start_pos, int) and start_pos == 0:
                 # next_start_pos = input_dict["input"].size(1) + outputs.size(1) - 1
                 # next_start_pos = last_seq_elem_indices.min().item() + 1
