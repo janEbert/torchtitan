@@ -31,7 +31,8 @@ class FlexAttention(torch.nn.Module):
     # new batch. We will use this to update the block mask when a
     # new batch is created. This also allows user to create different
     # block masks for different layers.
-    block_masks: ClassVar[dict[str, BlockMask]] = {}
+    block_masks: ClassVar[dict[tuple[str, int], BlockMask]] = {}
+    pad_cache: ClassVar[dict[str, torch.Tensor]] = {}
 
     # Instance variables.
     attn_mask_type: str
@@ -46,7 +47,8 @@ class FlexAttention(torch.nn.Module):
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
-        block_mask = FlexAttention.block_masks[self.attn_mask_type]
+        seq_len = q.shape[2]
+        block_mask = FlexAttention.block_masks[(self.attn_mask_type, seq_len)]
         return FlexAttention.flex_attn(q, k, v, block_mask=block_mask)
 
     @staticmethod
@@ -57,34 +59,49 @@ class FlexAttention(torch.nn.Module):
         return causal_mask
 
     @staticmethod
-    def _get_padded_causal_mask_fn(batch: torch.Tensor, start_pos: int, pad_id: int) -> Callable:
+    def _get_padded_causal_mask_fn(
+            batch: torch.Tensor,
+            start_pos: int,
+            pad_id: int,
+            pad_cache: torch.Tensor | None = None,
+    ) -> Callable:
         # batch is [b, s, h, d] shape
         mask = batch != pad_id
         q_offset = 0
         if start_pos > 0:
-            mask = torch.hstack([
-                torch.zeros(
+            if pad_cache is None:
+                warnings.warn(
+                    "Padding with KV caching is used, but pad cache was not initialized. "
+                    "Initializing automatically, but this may incorrect wrong results."
+                )
+                pad_cache = torch.ones(
                     (mask.shape[0], start_pos + 1 - mask.shape[1]) + mask.shape[2:],
                     dtype=mask.dtype,
                     device=mask.device,
-                ),
-                mask,
-            ])
-            # seqlen
-            if batch.shape[1] < mask.shape[1]:
+                )
+            mask = torch.hstack([pad_cache, mask])
+            # If we have a partial input, offset queries.
+            if batch.shape[1] <= start_pos:
                 q_offset = start_pos
+        if start_pos >= 0:
+            pad_cache = mask
 
         def padded_causal_mask(b, h, q_idx, kv_idx):
             return mask[b, q_idx + q_offset] & mask[b, kv_idx] & (q_idx + q_offset >= kv_idx)
 
-        return padded_causal_mask
+        return padded_causal_mask, pad_cache
 
     @staticmethod
-    def _get_cached_causal_mask_fn(start_pos: int) -> Callable:
+    def _get_cached_causal_mask_fn(batch: torch.Tensor, start_pos: int) -> Callable:
         assert start_pos >= 0
 
+        q_offset = 0
+        # If we have a partial input, offset queries.
+        if batch.shape[1] <= start_pos:
+            q_offset = start_pos
+
         def cached_causal_mask(b, h, q_idx, kv_idx):
-            return (kv_idx >= start_pos) & (q_idx >= kv_idx)
+            return (q_idx + q_offset >= start_pos) & (q_idx + q_offset >= kv_idx)
 
         return cached_causal_mask
 
@@ -93,16 +110,40 @@ class FlexAttention(torch.nn.Module):
             batch: torch.Tensor,
             start_pos: int,
             pad_id: int,
+            pad_cache: torch.Tensor | None = None,
     ) -> Callable:
         assert start_pos >= 0
 
         # batch is [b, s, h, d] shape
         mask = batch != pad_id
+        q_offset = 0
+        if start_pos > 0:
+            if pad_cache is None:
+                warnings.warn(
+                    "Padding with KV caching is used, but pad cache was not initialized. "
+                    "Initializing automatically, but this may incorrect wrong results."
+                )
+                pad_cache = torch.ones(
+                    (mask.shape[0], start_pos + 1 - mask.shape[1]) + mask.shape[2:],
+                    dtype=mask.dtype,
+                    device=mask.device,
+                )
+            mask = torch.hstack([pad_cache, mask])
+            # If we have a partial input, offset queries.
+            if batch.shape[1] <= start_pos:
+                q_offset = start_pos
+        if start_pos >= 0:
+            pad_cache = mask
 
         def cached_padded_causal_mask(b, h, q_idx, kv_idx):
-            return mask[b, q_idx] & mask[b, kv_idx] & (kv_idx >= start_pos) & (q_idx >= kv_idx)
+            return (
+                mask[b, q_idx + q_offset]
+                & mask[b, kv_idx]
+                & (q_idx + q_offset >= start_pos)
+                & (q_idx + q_offset >= kv_idx)
+            )
 
-        return cached_padded_causal_mask
+        return cached_padded_causal_mask, pad_cache
 
     @staticmethod
     def _get_block_causal_mask_fn(batch: torch.Tensor, eos_id: int) -> Callable:
@@ -129,37 +170,43 @@ class FlexAttention(torch.nn.Module):
         # batch is [b, s, h, d] shape
         for attn_mask_type in FlexAttention.used_attn_mask_types:
             seq_len = batch.shape[1]
-            use_cached_mask = start_pos >= 0 and seq_len > 1
+            use_cached_mask = start_pos >= 0
             use_padded_mask = pad_id is not None
+            if use_padded_mask:
+                pad_cache = FlexAttention.pad_cache.get(attn_mask_type)
+            else:
+                pad_cache = None
 
             match attn_mask_type:
                 case "causal":
                     if (
-                            start_pos < 0
+                            not use_cached_mask
                             and not use_padded_mask
-                            and FlexAttention.block_masks.get(attn_mask_type, None) is not None
+                            and FlexAttention.block_masks.get((attn_mask_type, seq_len)) is not None
                     ):
                         continue
                     # We don't care about batch dimension --
                     # all samples have the same lower triangle mask.
                     batch_dimension = 1
-                    if use_cached_mask:
+                    if use_cached_mask and start_pos > 0:
                         if use_padded_mask:
                             batch_dimension = batch.shape[0]
-                            mask_fn = FlexAttention._get_cached_padded_causal_mask_fn(
+                            mask_fn, pad_cache = FlexAttention._get_cached_padded_causal_mask_fn(
                                 batch,
                                 start_pos,
                                 pad_id,
+                                pad_cache,
                             )
                         else:
-                            mask_fn = FlexAttention._get_cached_causal_mask_fn(start_pos)
+                            mask_fn = FlexAttention._get_cached_causal_mask_fn(batch, start_pos)
                     else:
                         if use_padded_mask:
                             batch_dimension = batch.shape[0]
-                            mask_fn = FlexAttention._get_padded_causal_mask_fn(
+                            mask_fn, pad_cache = FlexAttention._get_padded_causal_mask_fn(
                                 batch,
                                 start_pos,
                                 pad_id,
+                                pad_cache,
                             )
                         else:
                             mask_fn = FlexAttention._get_causal_mask_fn()
@@ -188,7 +235,9 @@ class FlexAttention(torch.nn.Module):
                 seq_len,
                 seq_len + max(start_pos, 0),
             )
-            FlexAttention.block_masks[attn_mask_type] = block_mask
+            FlexAttention.block_masks[(attn_mask_type, seq_len)] = block_mask
+            if use_padded_mask:
+                FlexAttention.pad_cache[attn_mask_type] = pad_cache
 
 
 class ScaledDotProductAttention(torch.nn.Module):
