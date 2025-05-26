@@ -27,6 +27,7 @@ from torchtitan.components.ft import FTManager, has_torchft
 from torchtitan.config_manager import JobConfig
 from torchtitan.optimizers import DistributedScion, Scion
 from torchtitan.optimizers.muon_utils import zeropower_backends
+from torchtitan.tools.logging import logger
 
 __all__ = [
     "OptimizersContainer",
@@ -245,13 +246,31 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
             for k, v in sd.items()
         }
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+    def load_state_dict(
+        self, state_dict: dict[str, Any], preserve_lr: bool = True
+    ) -> None:
+        if preserve_lr:
+            # Store current learning rates
+            current_lrs = []
+            for optimizer in self.optimizers:
+                current_lrs.append([group["lr"] for group in optimizer.param_groups])
+
         func = functools.partial(
             set_optimizer_state_dict,
             optim_state_dict=state_dict,
             options=StateDictOptions(flatten_optimizer_state_dict=True),
         )
         list(map(func, self.model_parts, self.optimizers))
+
+        if preserve_lr:
+            # Restore the original learning rates
+            for optimizer, saved_lrs in zip(self.optimizers, current_lrs):
+                for param_group, current_lr in zip(optimizer.param_groups, saved_lrs):
+                    if param_group["lr"] != current_lr:
+                        logger.warning(
+                            f"Restoring lr from {param_group['lr']} to {current_lr} | for {param_group['param_names']}"
+                        )
+                        param_group["lr"] = current_lr
 
     @staticmethod
     def compute_grad(p, optimizer=None, **kwargs):
