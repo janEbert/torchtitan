@@ -884,7 +884,8 @@ class Transformer(nn.Module, ModelProtocol):
         )
 
         if start_pos >= 0:
-            # TODO fix freqs_cis with left-padding
+            # For some reason (maybe relativity of position embeddings)
+            # this works even with left-padding.
             freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
         else:
             freqs_cis = self.freqs_cis
