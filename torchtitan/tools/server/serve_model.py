@@ -426,13 +426,20 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
                 )
 
             input_tokens = input_dict["input"].tolist()
-            # Remove padding
             for (i, (sample, sample_first_seq_elem_index)) in enumerate(zip(
                     input_tokens,
                     first_seq_elem_indices,
             )):
-                input_tokens[i] = sample[sample_first_seq_elem_index:]
-            # TODO remove anything after EOS
+                # Remove padding
+                sample = sample[sample_first_seq_elem_index:]
+                # # Remove anything after EOS
+                # try:
+                #     eos_index = sample.find(self.server.tokenizer.eos_id)
+                # except ValueError:
+                #     pass
+                # else:
+                #     sample = sample[:eos_index + 1]
+                input_tokens[i] = sample
 
             output_dict.update(dict(
                 next_start_pos=next_start_pos,
