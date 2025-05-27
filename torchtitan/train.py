@@ -508,7 +508,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if parallel_dims.pp_enabled:
             # Pipeline Parallel forward / backward inside step() call
             with self.train_context(
-                optional_context_parallel_ctx, self.activations_handling_ctx
+                optional_context_parallel_ctx,
+                # self.activations_handling_ctx,
             ):
                 targets, losses = (
                     (labels, []) if self.pp_has_last_stage else (None, None)
@@ -531,7 +532,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             )
         else:
             # Non-PP forward / backward
-            with self.train_context(optional_context_parallel_ctx):
+            with self.train_context(
+                optional_context_parallel_ctx,
+                # self.activations_handling_ctx,
+            ):
                 assert len(model_parts) == 1
                 with self.maybe_enable_amp:
                     pred = model_parts[0](inputs, eos_id=self.tokenizer.eos_id)
