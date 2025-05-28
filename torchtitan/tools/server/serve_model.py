@@ -205,6 +205,7 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
         #     do nothing; this rank's output has been all-gathered
 
     # TODO spread/broadcast/shard/duplicate inputs depending on their batch size and DP size
+    # TODO also remove "finished" samples; can heuristically just check last seq elem for EOS token
     def _distribute_inputs(self, input_dict):
         inputs = input_dict["input"]
         start_pos = input_dict.get("start_pos", 0)
