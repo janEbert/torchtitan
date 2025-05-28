@@ -84,20 +84,20 @@ class MoEModelArgs(BaseModelArgs):
 
     def update_from_config(self, job_config: JobConfig, tokenizer: Tokenizer) -> None:
         for name in [
-                "first_in_init_fn_type",
-                "first_in_init_std",
-                "first_in_exp",
-                "router_init_fn_type",
-                "intermediate_init_fn_type",
-                "intermediate_init_std",
-                "intermediate_exp",
-                "init_gate_as_residual",
-                "final_out_init_fn_type",
-                "final_out_init_std",
-                "final_out_exp",
-                "norm_type",
-                "use_flex_attn",
-                "attn_mask_type",
+            "first_in_init_fn_type",
+            "first_in_init_std",
+            "first_in_exp",
+            "router_init_fn_type",
+            "intermediate_init_fn_type",
+            "intermediate_init_std",
+            "intermediate_exp",
+            "init_gate_as_residual",
+            "final_out_init_fn_type",
+            "final_out_init_std",
+            "final_out_exp",
+            "norm_type",
+            "use_flex_attn",
+            "attn_mask_type",
         ]:
             value = getattr(job_config.model, name)
             setattr(self, name, value)
@@ -161,7 +161,9 @@ class MoEModelArgs(BaseModelArgs):
         #    but recomputation should not be counted in calculating MFU           (+0)
         # 3. each matmul performs 1 multiplication and 1 addition                 (*2)
         # 4. we follow the convention and do not account for sparsity in causal attention
-        num_flops_per_token = 6 * (nparams_active - nparams_embedding) + 12 * l * h * q * t
+        num_flops_per_token = (
+            6 * (nparams_active - nparams_embedding) + 12 * l * h * q * t
+        )
 
         return nparams_active, nparams_total, num_flops_per_token
 
@@ -330,9 +332,12 @@ class SharedExperts(nn.Module):
         self.act_fn = activation
 
         if norm_everywhere:
-            assert norm_type is not None, \
-                "`norm_type` needs to be passed when `norm_everywhere=True`"
-            assert norm_eps is not None, "`norm_eps` needs to be passed when `norm_everywhere=True`"
+            assert (
+                norm_type is not None
+            ), "`norm_type` needs to be passed when `norm_everywhere=True`"
+            assert (
+                norm_eps is not None
+            ), "`norm_eps` needs to be passed when `norm_everywhere=True`"
             self.out_norm = build_norm(
                 norm_type,
                 dim=dim,
@@ -366,7 +371,7 @@ class MoE(nn.Module):
         self,
         dim: int,
         multiple_of: int = 256,
-        n_shared_experts: int = 2,
+        n_shared_experts: int = 1,
         n_routed_experts: int = 8,
         activate_experts: int = 2,
         ffn_dim_multiplier: Optional[float] = None,
@@ -389,19 +394,15 @@ class MoE(nn.Module):
         """
 
         if match_dim_with_dense:
-            total_activate_experts = n_shared_experts + activate_experts
-            ratio = total_activate_experts / (n_routed_experts + n_shared_experts)
+            ratio = 1.0 / (activate_experts + n_shared_experts)
         else:
             ratio = 1.0
 
-        hidden_dim = 4 * dim
-        hidden_dim = int(2 * hidden_dim / 3)
+        hidden_dim = 2 * 4 * dim / 3
         if ffn_dim_multiplier is not None:
-            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+            hidden_dim = ffn_dim_multiplier * hidden_dim
         hidden_dim = int(hidden_dim * ratio)
-
-        hidden_dim += -hidden_dim % multiple_of
-
+        hidden_dim = hidden_dim - hidden_dim % multiple_of
         self.n_routed_experts = n_routed_experts
         self.topk = activate_experts
         self.n_shared_experts = n_shared_experts
