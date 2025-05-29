@@ -88,7 +88,8 @@ class DistributedScion(torch.optim.Optimizer):
         mesh_dim_names = world_mesh.mesh_dim_names if world_mesh is not None else None
         self.fsdp_enabled = (
             mesh_dim_names is not None
-            and "dp_shard" in mesh_dim_names or "dp_shard_1" in mesh_dim_names
+            and "dp_shard" in mesh_dim_names
+            or "dp_shard_1" in mesh_dim_names
         )
         self.expert_enabled = (
             world_mesh is not None
@@ -166,10 +167,9 @@ class DistributedScion(torch.optim.Optimizer):
                 param_kwargs = self.groups_info[self.paramters_to_groups[id(p)]][-1]
                 norm_factor = param_kwargs["norm_factor"]
                 backend = param_kwargs["zeropower_backend"]
-                is_embed_norm = (
-                    norm_factor.startswith("embed")
-                    or norm_factor.startswith("unembed")
-                )
+                is_embed_norm = norm_factor.startswith(
+                    "embed"
+                ) or norm_factor.startswith("unembed")
 
                 if (
                     backend is zeropower_backends["identity"]
@@ -304,7 +304,9 @@ class DistributedScion(torch.optim.Optimizer):
 
         for param_idx in range(len(sgd_params)):
             p = sgd_params[param_idx]
-            lr, nesterov, momentum, param_kwargs = self.groups_info[self.paramters_to_groups[id(p)]]
+            lr, nesterov, momentum, param_kwargs = self.groups_info[
+                self.paramters_to_groups[id(p)]
+            ]
             g = self.get_momentum_or_grad(
                 p, momentum, nesterov, update_buffer=True, gather_to_local=False
             )
@@ -434,7 +436,7 @@ class DistributedScion(torch.optim.Optimizer):
 
             # Make sure target_shape is initialized
             if target_shape is None and end_idx > 0:
-                target_shape = fsdp_params[start_idx].shape
+                target_shape = fsdp_params[end_idx - 1].shape
 
             recv_shapes = [
                 calculate_shard_shape(target_shape, rank_idx, world_size)
