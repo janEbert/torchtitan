@@ -222,7 +222,7 @@ class JobConfig:
         self.parser.add_argument(
             "--model.first_in_init_fn_type",
             type=str,
-            default="normal",
+            default="scion_normal_input",
             choices=INIT_FN_TYPES,
             help="Weight initialization method to use for the first input layer.",
         )
@@ -243,21 +243,21 @@ class JobConfig:
         self.parser.add_argument(
             "--model.router_init_fn_type",
             type=str,
-            default="normal",
+            default="scion_normal_output",
             choices=INIT_FN_TYPES,
             help="Weight initialization method to use for router layers.",
         )
         self.parser.add_argument(
             "--model.intermediate_init_fn_type",
             type=str,
-            default="normal",
+            default="scaled_orthogonal",
             choices=INIT_FN_TYPES,
             help="Weight initialization method to use for intermediate layers.",
         )
         self.parser.add_argument(
             "--model.intermediate_init_std",
             type=float,
-            default=0.02,
+            default=1,
             help="Standard deviation multiplier for intermediate layers' weight initialization",
         )
         self.parser.add_argument(
@@ -269,7 +269,7 @@ class JobConfig:
                 intermediate layers' init std factors.""",
         )
         self.parser.add_argument(
-            "--model.no_init_gate_as_residual",
+            "--model.init_gate_as_residual",
             dest="model.init_gate_as_residual",
             action="store_false",
             help="Whether to initialize the GLU gate as if it was a residual layer.",
@@ -277,7 +277,7 @@ class JobConfig:
         self.parser.add_argument(
             "--model.final_out_init_fn_type",
             type=str,
-            default="trunc_normal",
+            default="scaled_orthogonal",
             choices=INIT_FN_TYPES,
             help="Weight initialization method to use for the final output layer.",
         )
@@ -290,7 +290,7 @@ class JobConfig:
         self.parser.add_argument(
             "--model.final_out_exp",
             type=float,
-            default=-0.5,
+            default=0.0,
             help="""
                 Exponent applied to the final output layer's input dimensionality
                 to obtain its init std factor.""",
@@ -368,7 +368,10 @@ class JobConfig:
             "--optimizer.eps", type=float, default=1e-8, help="Epsilon value to use"
         )
         self.parser.add_argument(
-            "--optimizer.weight_decay", type=float, default=0.1, help="Weight decay value to use"
+            "--optimizer.weight_decay",
+            type=float,
+            default=0.1,
+            help="Weight decay value to use",
         )
         self.parser.add_argument(
             "--optimizer.is_light",
@@ -394,7 +397,10 @@ class JobConfig:
             help="Number of steps for the Scion backend",
         )
         self.parser.add_argument(
-            "--optimizer.momentum", type=float, default=0.95, help="Scion momentum to use",
+            "--optimizer.momentum",
+            type=float,
+            default=0.1,
+            help="Scion momentum to use",
         )
         self.parser.add_argument(
             "--optimizer.nesterov",
@@ -491,7 +497,10 @@ class JobConfig:
 
         # training configs
         self.parser.add_argument(
-            "--training.dataset", type=string_list, default=["c4_test"], help="Dataset to use"
+            "--training.dataset",
+            type=string_list,
+            default=["c4_test"],
+            help="Dataset to use",
         )
         self.parser.add_argument(
             "--training.dataset_path",
@@ -574,6 +583,7 @@ class JobConfig:
         self.parser.add_argument(
             "--training.global_batch_size",
             type=int,
+            default=None,
             help=(
                 "Global batch size "
                 "(defaults to `training.batch_size * data-parallel degree`)"

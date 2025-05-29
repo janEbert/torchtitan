@@ -40,24 +40,24 @@ class MoEModelArgs(BaseModelArgs):
     # if `False`, each uses the total number of transformer blocks. If
     # `None`, do not apply any depth scaling.
     depth_init: Optional[bool] = True
-    first_in_init_fn_type: str = "normal"
+    first_in_init_fn_type: str = "scion_normal_input"
     first_in_init_std: float = 1.0
     # Exponent applied to the first input layer's input dimensionality
     # to obtain its init std factor.
     first_in_exp: float = 0.0
-    router_init_fn_type: str = "trunc_normal"
-    intermediate_init_fn_type: str = "trunc_normal"
-    intermediate_init_std: float = 0.02
+    router_init_fn_type: str = "scaled_orthogonal"
+    intermediate_init_fn_type: str = "scion_normal_output"
+    intermediate_init_std: float = 1.0
     # Exponent applied to the model's hidden dimensionality to obtain
     # intermediate layers' init std factors.
     intermediate_exp: float = 0.0
     # Whether to initialize the GLU gate as if it was a residual layer.
     init_gate_as_residual: bool = True
-    final_out_init_fn_type: str = "trunc_normal"
+    final_out_init_fn_type: str = "scion_normal_output"
     final_out_init_std: float = 1.0
     # Exponent applied to the final output layer's input dimensionality
     # to obtain its init std factor.
-    final_out_exp: float = -0.5
+    final_out_exp: float = 0.0
     norm_type: str = "rmsnorm"
     qk_norm: bool = False
     # If this is True, it implies `qk_norm=True`.
@@ -77,7 +77,7 @@ class MoEModelArgs(BaseModelArgs):
     activate_experts: int = 0
     moe_gate_bias_update_speed: float = 0.001  # dpskv3, 0.001
     moe_aux_loss_alpha: float = 0.01  # OLMoE, default 0.01
-    moe_routed_scaling_factor = None
+    moe_routed_scaling_factor: float = None
     # dpskv3 2.5, moonlight 2.446, set None to auto-compute
     moe_gate_use_bias_for_routing: bool = True
     moe_init_all_experts_same: bool = False
