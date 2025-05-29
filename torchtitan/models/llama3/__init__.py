@@ -162,8 +162,8 @@ llama3_configs = {
     "1B-Proxy": TransformerModelArgs(
         dim=256,
         n_layers=24,
-        n_heads=16,
-        n_kv_heads=8,
+        n_heads=2,
+        n_kv_heads=1,
         ffn_dim_multiplier=1,  # need to check
         multiple_of=64,
         qk_norm=True,
