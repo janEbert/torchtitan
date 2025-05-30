@@ -64,7 +64,9 @@ def rms_to_rms_norm(W):
 @torch.no_grad()
 def l1_to_rms_norm(W):
     assert W.ndim == 2, "operator norm can only be applied to matrices"
-    norm = torch.max(torch.linalg.norm(W.to(torch.float32), ord=2, dim=0, dtype=torch.float32))
+    norm = torch.max(
+        torch.linalg.norm(W.to(torch.float32), ord=2, dim=0, dtype=torch.float32)
+    )
     scale = torch.sqrt(torch.tensor(W.shape[0], dtype=W.dtype, device=W.device))
     norm /= scale
     return norm
@@ -73,7 +75,9 @@ def l1_to_rms_norm(W):
 @torch.no_grad()
 def rms_to_l1_norm(W):
     assert W.ndim == 2, "operator norm can only be applied to matrices"
-    norm = torch.max(torch.linalg.norm(W.to(torch.float32), ord=2, dim=1, dtype=torch.float32))
+    norm = torch.max(
+        torch.linalg.norm(W.to(torch.float32), ord=2, dim=1, dtype=torch.float32)
+    )
     scale = torch.sqrt(torch.tensor(W.shape[1], dtype=W.dtype, device=W.device))
     norm *= scale
     return norm
@@ -87,7 +91,7 @@ def supremum_norm(x):
 @torch.no_grad()
 def condition_number(W):
     assert W.ndim == 2, "condition number calculation can only be applied to matrices"
-    S = torch.linalg.svdvals(W.to(torch.float32), driver='gesvd')
+    S = torch.linalg.svdvals(W.to(torch.float32), driver="gesvd")
     return S[0] / S[-1]
 
 
@@ -296,7 +300,9 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
             eps = kwargs["eps"]
             weight_decay = kwargs["weight_decay"]
             beta1, beta2 = kwargs["betas"]
-            assert weight_decay == 0.0, "Weight decay not supported for grad computation."
+            assert (
+                weight_decay == 0.0
+            ), "Weight decay not supported for grad computation."
 
             param_optim_state = optimizer.state[p]
             if "step" not in param_optim_state:
@@ -306,7 +312,9 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
             if "exp_avg_sq" in param_optim_state and "exp_avg" in param_optim_state:
                 bias_correction1 = 1 - beta1**step
                 bias_correction2 = 1 - beta2**step
-                denom = (param_optim_state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2)) + eps
+                denom = (
+                    param_optim_state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2)
+                ) + eps
                 step_size = 1 / bias_correction1
                 g = step_size * param_optim_state["exp_avg"].div(denom)
             else:
@@ -333,7 +341,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                         "nesterov": group["nesterov"],
                         "eps": group["eps"],
                         "norm_factor": group["norm_factor"],
-                        "zeropower_backend": zeropower_backends[group["backend"]],
+                        "zeropower_backend": group["backend"],
                         "backend_steps": group["backend_steps"],
                     }
                 elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
@@ -371,7 +379,9 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                         if "tok_embeddings" in p_name:
                             p, update = p.T, update.T
                         for norm_name, norm_func in NORM_FUNCTIONS.items():
-                            if norm_name != "supremum" and (p.ndim < 2 or update.ndim < 2):
+                            if norm_name != "supremum" and (
+                                p.ndim < 2 or update.ndim < 2
+                            ):
                                 # Operator norms require a matrix.
                                 continue
                             elif p.ndim == 3 or update.ndim == 3:
@@ -579,9 +589,8 @@ def build_optimizers(
         foreach = optim_implementation == "foreach"
 
         mesh_dim_names = extra_kwargs["world_mesh"].mesh_dim_names
-        ep_enable = (
-            mesh_dim_names is not None
-            and ("dp_shard_1" in mesh_dim_names or "dp_shard_2" in mesh_dim_names)
+        ep_enable = mesh_dim_names is not None and (
+            "dp_shard_1" in mesh_dim_names or "dp_shard_2" in mesh_dim_names
         )
         if ep_enable:
             # Because for Expert Parallel, we have two different device meshes.
@@ -601,7 +610,8 @@ def build_optimizers(
             "lr": lr / width_multiplier,
             "eps": eps / width_multiplier,
             "betas": (0.9, 0.95),
-            "weight_decay": weight_decay * width_multiplier,  # WD is coupled with LR in torch AdamW
+            "weight_decay": weight_decay
+            * width_multiplier,  # WD is coupled with LR in torch AdamW
             "fused": fused,
             "foreach": foreach,
         }
