@@ -39,11 +39,11 @@ def _process_c4_text(sample: dict[str, Any]) -> str:
 
 
 def _load_simple_dataset(
-        dataset_path: str,
-        dataset_name: str | None,
-        dataset_files: str | Sequence[str] | None,
-        dataset_split: str,
-        dataset_streaming: bool,
+    dataset_path: str,
+    dataset_name: str | None,
+    dataset_files: str | Sequence[str] | None,
+    dataset_split: str,
+    dataset_streaming: bool,
 ):
     """Load a simple custom dataset with its configuration."""
     return load_dataset(
@@ -193,13 +193,15 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         self._sample_idx = 0
 
     def _get_data_iter(self):
-        if isinstance(self._data, Dataset) and self._sample_idx == len(self._data):
-            return iter([])
+        # For map-style datasets, resume by skipping to the correct index
+        # For iterable-style datasets, the underlying iterator already points to the correct index
+        if isinstance(self._data, Dataset):
+            if self._sample_idx == len(self._data):
+                return iter([])
+            else:
+                return iter(self._data.skip(self._sample_idx))
 
-        it = iter(self._data)
-        for _ in range(self._sample_idx):
-            next(it)
-        return it
+        return iter(self._data)
 
     def __iter__(self):
         while True:
@@ -246,7 +248,9 @@ class MixedDataset(IterableDataset, Stateful):
 
     def _sample_dataset(self, sample_idx: int):
         self._rng.seed(sample_idx)
-        dataset_index = self._rng.choices(self._dataset_indices, weights=self.weights)[0]
+        dataset_index = self._rng.choices(self._dataset_indices, weights=self.weights)[
+            0
+        ]
         return dataset_index
 
     def _get_next(self, dataset_index: int):
@@ -349,7 +353,9 @@ class GreedyPackedDataset(IterableDataset, Stateful):
                     yield {"input": input}, label
 
             if not self.infinite:
-                logger.warning(f"Packed dataset {self.dataset_name} has run out of data")
+                logger.warning(
+                    f"Packed dataset {self.dataset_name} has run out of data"
+                )
                 break
             else:
                 # Reset offset for the next iteration
@@ -484,24 +490,26 @@ def build_hf_dataloader(
     )
 
     if len(dataset_name) > 1:
-        assert dataset_files is None, \
-            "cannot supply dataset files when using multiple datasets"
+        assert (
+            dataset_files is None
+        ), "cannot supply dataset files when using multiple datasets"
     for d in [
-            dataset_path,
-            dataset_inner_name,
-            dataset_split,
-            dataset_key,
-            dataset_weights,
+        dataset_path,
+        dataset_inner_name,
+        dataset_split,
+        dataset_key,
+        dataset_weights,
     ]:
-        assert len(d) == normed_list_length, \
-            f"list {d} does not match length of list of datasets (length = {normed_list_length})"
+        assert (
+            len(d) == normed_list_length
+        ), f"list {d} does not match length of list of datasets (length = {normed_list_length})"
     hf_datasets = []
-    for (d_name, d_path, d_inner_name, d_split, d_key) in zip(
-            dataset_name,
-            dataset_path,
-            dataset_inner_name,
-            dataset_split,
-            dataset_key,
+    for d_name, d_path, d_inner_name, d_split, d_key in zip(
+        dataset_name,
+        dataset_path,
+        dataset_inner_name,
+        dataset_split,
+        dataset_key,
     ):
         hf_ds = HuggingFaceDataset(
             dataset_name=d_name,

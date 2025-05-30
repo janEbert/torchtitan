@@ -64,7 +64,9 @@ def rms_to_rms_norm(W):
 @torch.no_grad()
 def l1_to_rms_norm(W):
     assert W.ndim == 2, "operator norm can only be applied to matrices"
-    norm = torch.max(torch.linalg.norm(W.to(torch.float32), ord=2, dim=0, dtype=torch.float32))
+    norm = torch.max(
+        torch.linalg.norm(W.to(torch.float32), ord=2, dim=0, dtype=torch.float32)
+    )
     scale = torch.sqrt(torch.tensor(W.shape[0], dtype=W.dtype, device=W.device))
     norm /= scale
     return norm
@@ -73,7 +75,9 @@ def l1_to_rms_norm(W):
 @torch.no_grad()
 def rms_to_l1_norm(W):
     assert W.ndim == 2, "operator norm can only be applied to matrices"
-    norm = torch.max(torch.linalg.norm(W.to(torch.float32), ord=2, dim=1, dtype=torch.float32))
+    norm = torch.max(
+        torch.linalg.norm(W.to(torch.float32), ord=2, dim=1, dtype=torch.float32)
+    )
     scale = torch.sqrt(torch.tensor(W.shape[1], dtype=W.dtype, device=W.device))
     norm *= scale
     return norm
@@ -87,7 +91,7 @@ def supremum_norm(x):
 @torch.no_grad()
 def condition_number(W):
     assert W.ndim == 2, "condition number calculation can only be applied to matrices"
-    S = torch.linalg.svdvals(W.to(torch.float32), driver='gesvd')
+    S = torch.linalg.svdvals(W.to(torch.float32), driver="gesvd")
     return S[0] / S[-1]
 
 
@@ -104,6 +108,7 @@ def _remove_orig_mod_and_weight_for_p_name(name: str) -> str:
     # Remove ._orig_mod and .weight anywhere in the parameter name
     name = re.sub(r"\._orig_mod", "", name)
     name = re.sub(r"\.weight", "", name)
+    name = re.sub(r"\._checkpoint_wrapped_module", "", name)
     return name
 
 
@@ -134,11 +139,16 @@ def _extract_param_groups(
         }
         assert len(group_params["params"]) == len(group_params["param_names"])
 
+<<<<<<< HEAD
         if len(param_names) == 0:
             logger.warning(
                 f'Notice: No parameters found for `str_match` "{str_match}" on '
                 f'global rank {torch.distributed.get_rank()}'
             )
+=======
+        if len(param_names) == 0 or len(group_params["params"]) == 0:
+            logger.info(f" Notice: No parameters found for str_match: {str_match}")
+>>>>>>> 6e33998 (we should not add empty params_groups into optim.states, dcp.load_state get broken when loading empty params)
             continue
         group_params.update(param_group_config)
         params.append(group_params)
@@ -153,6 +163,41 @@ def _extract_param_groups(
     )
     assert not param_dict
     return params
+
+
+import torch.distributed as dist
+from collections import defaultdict
+
+
+def gather_and_merge(local_stats: dict, dst: int = 0):
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    dtype = torch.bfloat16
+
+    my_keys = list(local_stats.keys())
+    key_bucket: List[Any] | None = [None] * world if rank == dst else None
+    dist.gather_object(my_keys, key_bucket, dst=dst)
+    dist.barrier()
+
+    val_tensor = torch.stack([local_stats[k].to(dtype) for k in my_keys])
+
+    gather_list = (
+        [torch.empty_like(val_tensor) for _ in range(world)] if rank == dst else None
+    )
+    dist.gather(val_tensor, gather_list=gather_list, dst=dst)
+    dist.barrier()
+
+    merged = {}
+    if rank == dst:
+        for peer, keys in enumerate(key_bucket):
+            for k, v in zip(keys, gather_list[peer]):
+                merged[k] = v
+
+    dist.barrier()
+    if rank == dst:
+        return merged
+    else:
+        return {}
 
 
 class OptimizersContainer(Optimizer, Stateful, Generic[T]):
@@ -303,7 +348,9 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
             eps = kwargs["eps"]
             weight_decay = kwargs["weight_decay"]
             beta1, beta2 = kwargs["betas"]
-            assert weight_decay == 0.0, "Weight decay not supported for grad computation."
+            assert (
+                weight_decay == 0.0
+            ), "Weight decay not supported for grad computation."
 
             param_optim_state = optimizer.state[p]
             if "step" not in param_optim_state:
@@ -313,7 +360,9 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
             if "exp_avg_sq" in param_optim_state and "exp_avg" in param_optim_state:
                 bias_correction1 = 1 - beta1**step
                 bias_correction2 = 1 - beta2**step
-                denom = (param_optim_state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2)) + eps
+                denom = (
+                    param_optim_state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2)
+                ) + eps
                 step_size = 1 / bias_correction1
                 g = step_size * param_optim_state["exp_avg"].div(denom)
             else:
@@ -329,7 +378,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
             )
 
     def get_parameter_norms(self):
-        norms = {}
+        all_norms = {}
         for i, _ in enumerate(self.model_parts):
             # NB: assumes correspondences between model parts and optimizers
             optimizer = self.optimizers[i]
@@ -356,8 +405,9 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                     )
                     continue
 
+                FLAG_NEED_SYNC = False
+                moe_norms, fsdp_norms = {}, {}
                 for p_name, p in zip(group["param_names"], group["params"]):
-
                     """
                     the module name usally named
                     track_update_condition_number/model_part_0/layers.0._orig_mod.attention.wo.weight
@@ -365,34 +415,48 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                     """
                     cleaned_p_name = _remove_orig_mod_and_weight_for_p_name(p_name)
                     g = self.compute_grad(p, optimizer, **param_kwargs)
+                    assert not torch.isnan(
+                        g
+                    ).any(), f"There is nan in the grad of {p_name}"
                     if g is not None:
-                        p = (
-                            p.redistribute(
-                                placements=[Replicate()] * p.device_mesh.ndim,
-                            ).to_local()
-                            if isinstance(p, DTensor)
-                            else p
-                        )
+                        if p.ndim < 3:
+                            p = p.redistribute(
+                                placements=[Replicate()] * p.device_mesh.ndim
+                            )
+                        else:
+                            FLAG_NEED_SYNC = True
+                            local_rank = dist.get_rank()
+                            world_size = dist.get_world_size()
+                            ep_per_rank = p.shape[0] // world_size
+                            # We dont gather the parameters for 3D tensors, which is [G, D_in, D_out] of GroupedExperts
+                            pass
+                        p = p.to_local() if isinstance(p, DTensor) else p
                         g = g.to_local() if isinstance(g, DTensor) else g
                         update = -group["lr"] * g
+
                         if "tok_embeddings" in p_name:
                             p, update = p.T, update.T
                         for norm_name, norm_func in NORM_FUNCTIONS.items():
-                            if norm_name != "supremum" and (p.ndim < 2 or update.ndim < 2):
+                            if norm_name != "supremum" and (
+                                p.ndim < 2 or update.ndim < 2
+                            ):
                                 # Operator norms require a matrix.
                                 continue
                             elif p.ndim == 3 or update.ndim == 3:
                                 # Special handling for grouped MoE.
+                                # remember MoE's Paramters is [G, D_in, D_out]
+                                # But we expected to call norm_func for [D_out, D_in]
                                 for ep_idx in range(p.shape[0]):
-                                    norms[
-                                        f"track_update_{norm_name}/model_part_{i}/ep_{ep_idx}/"
+                                    actual_ep_idx = ep_idx + local_rank * ep_per_rank
+                                    moe_norms[
+                                        f"track_update_{norm_name}/model_part_{i}/ep_{actual_ep_idx}/"
                                         f"{cleaned_p_name}"
-                                    ] = norm_func(update[ep_idx])
+                                    ] = norm_func(update[ep_idx].transpose(0, 1))
 
-                                    norms[
-                                        f"track_param_{norm_name}/model_part_{i}/ep_{ep_idx}/"
+                                    moe_norms[
+                                        f"track_param_{norm_name}/model_part_{i}/ep_{actual_ep_idx}/"
                                         f"{cleaned_p_name}"
-                                    ] = norm_func(p[ep_idx])
+                                    ] = norm_func(p[ep_idx].transpose(0, 1))
 
                             else:
                                 if p.ndim > 2 or update.ndim > 2:
@@ -402,14 +466,23 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                                         f"this may not be an issue, but please ensure its "
                                         f"norms are calculated correctly."
                                     )
-                                norms[
+                                fsdp_norms[
                                     f"track_param_{norm_name}/model_part_{i}/{cleaned_p_name}"
                                 ] = norm_func(p)
-                                norms[
+
+                                fsdp_norms[
                                     f"track_update_{norm_name}/model_part_{i}/{cleaned_p_name}"
                                 ] = norm_func(update)
 
-        return norms
+                if FLAG_NEED_SYNC:
+                    # remove the comment below to gather the moe_norms on all ranks
+                    moe_norms = gather_and_merge(moe_norms)
+                    pass
+
+                all_norms.update(fsdp_norms)
+                all_norms.update(moe_norms)
+
+        return all_norms
 
     def get_lrs(self):
         lrs = {}
@@ -586,9 +659,8 @@ def build_optimizers(
         foreach = optim_implementation == "foreach"
 
         mesh_dim_names = extra_kwargs["world_mesh"].mesh_dim_names
-        ep_enable = (
-            mesh_dim_names is not None
-            and ("dp_shard_1" in mesh_dim_names or "dp_shard_2" in mesh_dim_names)
+        ep_enable = mesh_dim_names is not None and (
+            "dp_shard_1" in mesh_dim_names or "dp_shard_2" in mesh_dim_names
         )
         if ep_enable:
             # Because for Expert Parallel, we have two different device meshes.
@@ -608,7 +680,8 @@ def build_optimizers(
             "lr": lr / width_multiplier,
             "eps": eps / width_multiplier,
             "betas": (0.9, 0.95),
-            "weight_decay": weight_decay * width_multiplier,  # WD is coupled with LR in torch AdamW
+            "weight_decay": weight_decay
+            * width_multiplier,  # WD is coupled with LR in torch AdamW
             "fused": fused,
             "foreach": foreach,
         }
@@ -670,8 +743,10 @@ def build_optimizers(
         if is_scion:
             # param_group_config["norm_factor"] = "image_spectral"
             # param_group_config["backend"] = zeropower_backend_algorithm
-            param_group_config["norm_factor"] = "none"
-            param_group_config["backend"] = "identity"
+            # param_group_config["norm_factor"] = "none"
+            # param_group_config["backend"] = "identity"
+            param_group_config["norm_factor"] = "spectral"
+            param_group_config["backend"] = zeropower_backend_algorithm
 
         param_groups_config.append(param_group_config)
 
