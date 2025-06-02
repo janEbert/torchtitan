@@ -84,20 +84,20 @@ class MoEModelArgs(BaseModelArgs):
 
     def update_from_config(self, job_config: JobConfig, tokenizer: Tokenizer) -> None:
         for name in [
-                "first_in_init_fn_type",
-                "first_in_init_std",
-                "first_in_exp",
-                "router_init_fn_type",
-                "intermediate_init_fn_type",
-                "intermediate_init_std",
-                "intermediate_exp",
-                "init_gate_as_residual",
-                "final_out_init_fn_type",
-                "final_out_init_std",
-                "final_out_exp",
-                "norm_type",
-                "use_flex_attn",
-                "attn_mask_type",
+            "first_in_init_fn_type",
+            "first_in_init_std",
+            "first_in_exp",
+            "router_init_fn_type",
+            "intermediate_init_fn_type",
+            "intermediate_init_std",
+            "intermediate_exp",
+            "init_gate_as_residual",
+            "final_out_init_fn_type",
+            "final_out_init_std",
+            "final_out_exp",
+            "norm_type",
+            "use_flex_attn",
+            "attn_mask_type",
         ]:
             value = getattr(job_config.model, name)
             setattr(self, name, value)
@@ -161,7 +161,9 @@ class MoEModelArgs(BaseModelArgs):
         #    but recomputation should not be counted in calculating MFU           (+0)
         # 3. each matmul performs 1 multiplication and 1 addition                 (*2)
         # 4. we follow the convention and do not account for sparsity in causal attention
-        num_flops_per_token = 6 * (nparams_active - nparams_embedding) + 12 * l * h * q * t
+        num_flops_per_token = (
+            6 * (nparams_active - nparams_embedding) + 12 * l * h * q * t
+        )
 
         return nparams_active, nparams_total, num_flops_per_token
 
@@ -330,9 +332,12 @@ class SharedExperts(nn.Module):
         self.act_fn = activation
 
         if norm_everywhere:
-            assert norm_type is not None, \
-                "`norm_type` needs to be passed when `norm_everywhere=True`"
-            assert norm_eps is not None, "`norm_eps` needs to be passed when `norm_everywhere=True`"
+            assert (
+                norm_type is not None
+            ), "`norm_type` needs to be passed when `norm_everywhere=True`"
+            assert (
+                norm_eps is not None
+            ), "`norm_eps` needs to be passed when `norm_everywhere=True`"
             self.out_norm = build_norm(
                 norm_type,
                 dim=dim,
@@ -479,12 +484,12 @@ class MoE(nn.Module):
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         bz, slen, dim = x.shape
-        x = rearrange(x, "b s d -> (b s) d")  # Flatten batch & sequence
-        out = torch.zeros_like(x)
+        x_flat = x.view(bz * slen, dim)
+        out = torch.zeros(x_flat.shape, device=x.device, dtype=x.dtype)
 
         if self.topk > 0:
             # (B*S, K), (B*S, K)
-            weights, indices, scores = self.gate(x)
+            weights, indices, scores = self.gate(x_flat)
 
             with torch.no_grad():
                 # [seq_len, n_routed_experts]
@@ -496,7 +501,19 @@ class MoE(nn.Module):
                 idxs = indices.view(-1).argsort()
                 sorted_tokens_shape = idxs.shape + x.shape[1:]
 
-            sorted_tokens = x[idxs // indices.shape[1]]
+                idxs = idxs.long()
+                assert idxs.min() >= 0 and idxs.max() < (indices.numel()), (
+                    f"“idxs” unexpectedly out of range:  "
+                    f"min={idxs.min().item()}, max={idxs.max().item()}, "
+                    f"indices.numel={indices.numel()}"
+                )
+
+            token_indices_for_sorted = (
+                idxs // indices.shape[1]
+            )  # shape [B⋅S⋅K], each entry in [0..B⋅S−1]
+            sorted_tokens = x_flat[token_indices_for_sorted]
+
+            sorted_weights = weights.view(-1)[idxs]
 
             experts_input, all_tokens_per_expert = ep_comm.dispatch_tokens(
                 sorted_tokens,
@@ -520,8 +537,9 @@ class MoE(nn.Module):
             original_token_indices = idxs // indices.shape[1]
 
             # Apply weights
-            expert_weights = weights.view(-1)[idxs].unsqueeze(1)
-            weighted_outputs = routed_output * expert_weights
+
+            weighted_outputs = routed_output * sorted_weights.unsqueeze(1)
+
             out.index_add_(
                 0, original_token_indices, weighted_outputs.to(routed_output.dtype)
             )
@@ -529,9 +547,8 @@ class MoE(nn.Module):
         # Apply shared experts if they exist
         if self.shared_experts is not None:
             # Reshape input for shared experts: (n_shared_experts, B*S, dim)
-            shared_input = torch.stack([x] * self.n_shared_experts, dim=0)
+            shared_input = x_flat.unsqueeze(0).expand(self.n_shared_experts, -1, -1)
             shared_output = self.shared_experts(shared_input).sum(0)
-
             out = out + shared_output
 
         if self.training:
@@ -547,7 +564,7 @@ class MoE(nn.Module):
         else:
             routing_entropy = torch.tensor(0.0, device=x.device)
 
-        output = rearrange(out, "(b s) d -> b s d", b=bz, s=slen)
+        output = out.view(bz, slen, dim)
         return output, aux_loss, routing_entropy
 
     def sequence_wise_aux_loss(
