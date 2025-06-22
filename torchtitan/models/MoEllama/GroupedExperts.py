@@ -4,9 +4,12 @@ import torch
 from torch import nn
 import torch.distributed as dist
 import torch.nn.functional as F
+from einops import rearrange
 
 from torchtitan.models.inits import build_init_fn
 from torchtitan.models.norms import build_norm
+
+from torchtitan.experiments.kernels.FBGEMM_moe.grouped_gemm import grouped_gemm
 
 
 class GroupedExperts(nn.Module):
@@ -53,9 +56,12 @@ class GroupedExperts(nn.Module):
         self.init_all_experts_same = moe_init_all_experts_same
 
         if norm_everywhere:
-            assert norm_type is not None, \
-                "`norm_type` needs to be passed when `norm_everywhere=True`"
-            assert norm_eps is not None, "`norm_eps` needs to be passed when `norm_everywhere=True`"
+            assert (
+                norm_type is not None
+            ), "`norm_type` needs to be passed when `norm_everywhere=True`"
+            assert (
+                norm_eps is not None
+            ), "`norm_eps` needs to be passed when `norm_everywhere=True`"
             self.out_norm = build_norm(norm_type, dim=dim_in, eps=norm_eps)
         else:
             self.out_norm = nn.Identity()
@@ -79,6 +85,8 @@ class GroupedExperts(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        m_sizes: torch.Tensor | list[int] | None = None,
+        m_offset: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -88,26 +96,19 @@ class GroupedExperts(nn.Module):
             torch.Tensor: with shape (experts_per_rank, tokens_per_expert, dim_in) for Expert Choice(EC).
         """
 
-        if isinstance(self.gate_proj, torch.distributed.tensor.DTensor):
-            h = self.act_fn(torch.bmm(x, self.gate_proj.to_local()))
-            h = h * torch.bmm(x, self.down_proj.to_local())
-            h = self.out_norm(h)
-            out = torch.bmm(h, self.up_proj.to_local())
-
-        else:
-            h = self.act_fn(torch.bmm(x, self.gate_proj))
-            h = h * torch.bmm(x, self.down_proj)
-            h = self.out_norm(h)
-            out = torch.bmm(h, self.up_proj)
+        h = grouped_gemm(x, reshape_weights(self.gate_proj), m_sizes)
+        h = self.act_fn(h) * grouped_gemm(x, reshape_weights(self.down_proj), m_sizes)
+        h = self.out_norm(h)
+        out = grouped_gemm(h, reshape_weights(self.up_proj), m_sizes)
 
         return out
 
     def init_weights(
-            self,
-            init_std: float,
-            residual_div: float,
-            init_gate_as_residual: bool,
-            init_fn_type: str,
+        self,
+        init_std: float,
+        residual_div: float,
+        init_gate_as_residual: bool,
+        init_fn_type: str,
     ):
 
         init_fn = build_init_fn(init_fn_type)
@@ -122,6 +123,16 @@ class GroupedExperts(nn.Module):
         expert_init_fn(init_fn, self.gate_proj.data, init_std)
         expert_init_fn(init_fn, self.down_proj.data, gate_init_std)
         expert_init_fn(init_fn, self.up_proj.data, init_std / residual_div)
+
+
+def reshape_weights(weights):
+    # From [G, D_in, D_out] → [G, D_out, D_in]
+    # Flatten to [G * D_out, D_in]
+    if isinstance(weights, torch.distributed.tensor.DTensor):
+        return rearrange(weights.to_local(), "g d_in d_out -> (g d_out) d_in")
+    else:
+        weights = rearrange(weights, "g d_in d_out -> (g d_out) d_in")
+    return weights
 
 
 def init_all_experts_same(init_fn, w, init_std):

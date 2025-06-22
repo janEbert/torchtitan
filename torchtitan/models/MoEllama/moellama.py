@@ -16,11 +16,14 @@ from torchtitan.models.llama3.model import Attention, precompute_freqs_cis
 from torchtitan.models.norms import build_norm
 from torchtitan.protocols.train_spec import BaseModelArgs, ModelProtocol
 from torchtitan.tools.logging import logger
-
+from torchtitan.experiments.kernels.moe.indices import generate_permute_indices
 
 from .GroupedExperts import GroupedExperts
-from . import ep_comm
+
+# from . import ep_comm # remove EP for debug-run
 from .moe_utils import calc_gate_scaling_factor
+
+ALIGN_SIZE_M = 16
 
 
 @dataclass
@@ -179,7 +182,6 @@ class Gate(nn.Module):
         topk=2,
         bias=True,
         bias_update_speed=0.001,
-        routed_scaling_factor: float = 1.0,
     ):
         super().__init__()
 
@@ -193,7 +195,6 @@ class Gate(nn.Module):
         else:
             self.bias = None
 
-        self.routed_scaling_factor = routed_scaling_factor
         # Bias for load balancing
         self.bias_update_speed = bias_update_speed
         # Step size for updating bias dynamically
@@ -224,14 +225,15 @@ class Gate(nn.Module):
         if self.bias is not None:
             nn.init.zeros_(self.bias)
 
+    @torch.compile(fullgraph=True)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: Input tensor of shape (B*S, D)
         Returns:
-            weights: Normalized routing weights
+            weights: Normalized routing weights, used for sum up the expert outputs
             indices: Selected expert indices
-            scores: Expert selection scores
+            scores: Expert selection scores, used for auxiliary loss
         """
         # Compute expert selection scores (sigmoid-based gating)
 
@@ -247,14 +249,11 @@ class Gate(nn.Module):
             biased_scores = scores
 
         # Select top-k experts
-        top_values, indices = torch.topk(biased_scores, self.topk, dim=-1)
+        _, indices = torch.topk(biased_scores, self.topk, dim=-1)
 
         # Extract and normalize weights
         weights = scores.gather(-1, indices)
         weights = weights / weights.sum(dim=-1, keepdim=True)
-
-        # Apply route scaling
-        weights = weights * self.routed_scaling_factor
 
         if self.training and self.bias is not None:
             self.accumulate_adjustment(indices)
@@ -346,6 +345,7 @@ class SharedExperts(nn.Module):
         else:
             self.out_norm = nn.Identity()
 
+    @torch.compile(fullgraph=True)
     def forward(self, x):
         h = self.act_fn(self.gate_proj(x))
         h = h * self.down_proj(x)
@@ -407,7 +407,7 @@ class MoE(nn.Module):
         self.topk = activate_experts
         self.n_shared_experts = n_shared_experts
         self.aux_loss_alpha = aux_loss_alpha  # Loss coefficient
-
+        self.routed_scaling_factor = routed_scaling_factor
         # Use updated Gate with DeepSeekMoE-style routing and bias balancing
         self.gate = Gate(
             hidden_size=dim,
@@ -415,7 +415,6 @@ class MoE(nn.Module):
             topk=activate_experts,
             bias=use_bias_for_routing,
             bias_update_speed=bias_update_speed,
-            routed_scaling_factor=routed_scaling_factor,
         )
 
         # Shared Experts (applies to all tokens)
@@ -485,71 +484,67 @@ class MoE(nn.Module):
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         bz, slen, dim = x.shape
         x_flat = x.view(bz * slen, dim)
-        out = torch.zeros(x_flat.shape, device=x.device, dtype=x.dtype)
+        # TODO@JSC: check if we want to use FP32 remix
+        # REMIX_DTYPE = x_flat.dtype
+        REMIX_DTYPE = torch.float32
+        out = torch.zeros(x_flat.shape, device=x_flat.device, dtype=REMIX_DTYPE)
 
         if self.topk > 0:
             # (B*S, K), (B*S, K)
             weights, indices, scores = self.gate(x_flat)
+            perm = torch.argsort(indices.view(-1), stable=True)
+            sorted_weights = weights.view(-1)[perm]
+            token_indices = perm // self.topk
+
+            num_local_tokens_per_expert = torch.histc(
+                indices.view(-1),
+                bins=self.n_routed_experts,
+                min=0,
+                max=self.n_routed_experts,
+            ).to(torch.int64)
+
+            token_indices = token_indices.reshape(-1, 1).expand(-1, dim)
+
+            routed_input = torch.gather(x_flat, dim=0, index=token_indices)
 
             with torch.no_grad():
-                # [seq_len, n_routed_experts]
-                cnts = indices.new_zeros((indices.shape[0], self.n_routed_experts))
-                # Fill 1 to the selected experts
-                cnts.scatter_(1, indices, 1)
-                tokens_per_expert = cnts.sum(dim=0)
-                # Token indices for each expert
-                idxs = indices.view(-1).argsort()
-                sorted_tokens_shape = idxs.shape + x.shape[1:]
-
-                idxs = idxs.long()
-                assert idxs.min() >= 0 and idxs.max() < (indices.numel()), (
-                    f"“idxs” unexpectedly out of range:  "
-                    f"min={idxs.min().item()}, max={idxs.max().item()}, "
-                    f"indices.numel={indices.numel()}"
+                (
+                    permuted_indices,
+                    m_sizes,
+                    m_offset,
+                ) = generate_permute_indices(
+                    num_local_tokens_per_expert,
+                    self.experts.expert_per_rank,
+                    self.experts.ep_size,
+                    ALIGN_SIZE_M,
                 )
 
-            token_indices_for_sorted = (
-                idxs // indices.shape[1]
-            )  # shape [B⋅S⋅K], each entry in [0..B⋅S−1]
-            sorted_tokens = x_flat[token_indices_for_sorted]
+            token_indices = torch.vstack(
+                (token_indices, token_indices.new_zeros((dim)))
+            )
+            token_indices = token_indices[permuted_indices, :]
 
-            sorted_weights = weights.view(-1)[idxs]
+            routed_input = torch.vstack((routed_input, routed_input.new_zeros((dim))))
+            routed_input = routed_input[permuted_indices, :]
 
-            experts_input, all_tokens_per_expert = ep_comm.dispatch_tokens(
-                sorted_tokens,
-                self.experts.ep_mesh,
-                self.experts.ep_size,
-                tokens_per_expert,
-                force_float32=False,
+            sorted_weights = torch.cat([sorted_weights, sorted_weights.new_zeros(1)])
+
+            perm_weights = (
+                sorted_weights[permuted_indices].unsqueeze(1)
+                * self.routed_scaling_factor
             )
 
-            experts_output = self.experts(experts_input)
+            routed_output = self.experts(routed_input, m_sizes, m_offset).to(
+                REMIX_DTYPE
+            ) * perm_weights.to(REMIX_DTYPE)
 
-            routed_output = ep_comm.combine_tokens(
-                experts_output,
-                self.experts.ep_mesh,
-                self.experts.ep_size,
-                all_tokens_per_expert,
-                force_float32=False,
-            )
-
-            # Map back from sorted tokens to original positions
-            original_token_indices = idxs // indices.shape[1]
-
-            # Apply weights
-
-            weighted_outputs = routed_output * sorted_weights.unsqueeze(1)
-
-            out.index_add_(
-                0, original_token_indices, weighted_outputs.to(routed_output.dtype)
-            )
+            out = out.scatter_add(dim=0, index=token_indices, src=routed_output)
 
         # Apply shared experts if they exist
         if self.shared_experts is not None:
             # Reshape input for shared experts: (n_shared_experts, B*S, dim)
-            shared_input = x_flat.unsqueeze(0).expand(self.n_shared_experts, -1, -1)
-            shared_output = self.shared_experts(shared_input).sum(0)
-            out = out + shared_output
+            shared_output = self.shared_experts(x_flat.unsqueeze(0)).sum(0)
+            out = out + shared_output.to(REMIX_DTYPE)
 
         if self.training:
             aux_loss = self.sequence_wise_aux_loss(indices, scores, bz, slen)
@@ -557,16 +552,17 @@ class MoE(nn.Module):
             aux_loss = torch.tensor(0.0, device=x.device)
 
         if self.topk > 0:
-            correct_weights = weights.detach() / self.gate.routed_scaling_factor
+            detached_weights = weights.detach()
             routing_entropy = (
-                -(correct_weights * correct_weights.log()).sum(dim=-1).mean()
+                -(detached_weights * detached_weights.log()).sum(dim=-1).mean()
             )
         else:
             routing_entropy = torch.tensor(0.0, device=x.device)
 
-        output = out.view(bz, slen, dim)
+        output = out.reshape(bz, slen, dim).to(x.dtype)
         return output, aux_loss, routing_entropy
 
+    @torch.compile(fullgraph=True)
     def sequence_wise_aux_loss(
         self,
         indices: torch.Tensor,  # Shape (B*S, K_val), type long
