@@ -429,7 +429,9 @@ def apply_compile(model: nn.Module):
         torch._dynamo.config.capture_scalar_outputs = True
         torch._dynamo.config.capture_dynamic_output_shape_ops = True
         torch._dynamo.config.suppress_errors = True
-        transformer_block = torch.compile(transformer_block, dynamic=False)
+        transformer_block = torch.compile(
+            transformer_block, dynamic=False, mode="max-autotune"
+        )
         model.layers.register_module(layer_id, transformer_block)
 
     logger.info("Compiling each TransformerBlock with torch.compile")

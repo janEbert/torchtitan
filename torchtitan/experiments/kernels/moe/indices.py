@@ -211,7 +211,7 @@ def generate_permute_indices(
             total_size,
         )
 
-    return permuted_indices, m_sizes, m_offsets.to(torch.int32)
+    return permuted_indices.to(torch.int32), m_sizes, m_offsets.to(torch.int32)
 
 
 # Below is for testing only

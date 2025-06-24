@@ -12,7 +12,12 @@ from torchtitan.components.tokenizer import Tokenizer
 from torchtitan.config_manager import JobConfig
 from torchtitan.models.inits import build_init_fn
 from torchtitan.models.inputs import MoEInputs, MoEInputsDict
-from torchtitan.models.llama3.model import Attention, precompute_freqs_cis
+from torchtitan.models.llama3.model import (
+    Attention,
+    precompute_freqs_cis,
+    apply_rotary_emb,
+    repeat_kv,
+)
 from torchtitan.models.norms import build_norm
 from torchtitan.protocols.train_spec import BaseModelArgs, ModelProtocol
 from torchtitan.tools.logging import logger
@@ -346,10 +351,12 @@ class SharedExperts(nn.Module):
             self.out_norm = nn.Identity()
 
     @torch.compile(fullgraph=True)
-    def forward(self, x):
+    def forward(self, x, cast_type=None):
         h = self.act_fn(self.gate_proj(x))
         h = h * self.down_proj(x)
         out = self.out_norm(self.up_proj(h))
+        if cast_type is not None:
+            out = out.to(cast_type)
         return out
 
     def init_weights(
@@ -364,6 +371,57 @@ class SharedExperts(nn.Module):
         init_fn(self.up_proj.weight, mean=0.0, std=init_std / residual_div)
         gate_init_std = init_std / residual_div if init_gate_as_residual else init_std
         init_fn(self.down_proj.weight, mean=0.0, std=gate_init_std)
+
+
+@torch.compile(dynamic=True)
+def mixed_experts_output(
+    out,
+    routed_output,
+    token_indices,
+    sorted_weights,
+    scaling_factor,
+    cast_type=None,
+):
+    out = out.scatter_add(
+        dim=0,
+        index=token_indices,
+        src=(routed_output * sorted_weights * scaling_factor).to(cast_type),
+    )
+    return out
+
+
+@torch.compile(fullgraph=True, mode="reduce-overhead")
+def prefill_buffer(
+    routed_input,
+    token_indices,
+    sorted_weights,
+    x_flat,
+    idx,
+    weights,
+    perm,
+):
+    token_indices[:-1].copy_(idx)
+    sorted_weights[:-1].copy_(weights.view(-1)[perm])
+    routed_input[:-1].copy_(x_flat[idx])
+
+
+@torch.compile(dynamic=True)
+def execute_permute(
+    routed_input,
+    token_indices,
+    sorted_weights,
+    permuted_indices,
+    dim,
+):
+    routed_input = routed_input[permuted_indices, :]
+    token_indices = token_indices[permuted_indices]
+    sorted_weights = sorted_weights[permuted_indices]
+
+    return (
+        routed_input,
+        token_indices.reshape(-1, 1).expand(-1, dim),
+        sorted_weights.unsqueeze(1),
+    )
 
 
 class MoE(nn.Module):
@@ -407,7 +465,11 @@ class MoE(nn.Module):
         self.topk = activate_experts
         self.n_shared_experts = n_shared_experts
         self.aux_loss_alpha = aux_loss_alpha  # Loss coefficient
-        self.routed_scaling_factor = routed_scaling_factor
+        # self.routed_scaling_factor = routed_scaling_factor
+        self.register_buffer(
+            "routed_scaling_factor",
+            torch.tensor(routed_scaling_factor, dtype=torch.float32),
+        )
         # Use updated Gate with DeepSeekMoE-style routing and bias balancing
         self.gate = Gate(
             hidden_size=dim,
@@ -485,16 +547,30 @@ class MoE(nn.Module):
         bz, slen, dim = x.shape
         x_flat = x.view(bz * slen, dim)
         # TODO@JSC: check if we want to use FP32 remix
-        # REMIX_DTYPE = x_flat.dtype
-        REMIX_DTYPE = torch.float32
-        out = torch.zeros(x_flat.shape, device=x_flat.device, dtype=REMIX_DTYPE)
+        REMIX_DTYPE = x_flat.dtype
+        # REMIX_DTYPE = torch.float32
+
+        if self.shared_experts is not None:
+            out = self.shared_experts(x_flat, REMIX_DTYPE)
+        else:
+            out = torch.zeros(x_flat.shape, device=x_flat.device, dtype=REMIX_DTYPE)
+
+        total_tokens = bz * slen * self.topk
+        routed_input = torch.zeros(
+            total_tokens + 1, dim, device=x_flat.device, dtype=x_flat.dtype
+        )
+        token_indices = torch.zeros(
+            total_tokens + 1, dtype=torch.int64, device=x_flat.device
+        )
+        sorted_weights = torch.zeros(
+            total_tokens + 1, dtype=torch.float32, device=x_flat.device
+        )
 
         if self.topk > 0:
             # (B*S, K), (B*S, K)
             weights, indices, scores = self.gate(x_flat)
             perm = torch.argsort(indices.view(-1), stable=True)
-            sorted_weights = weights.view(-1)[perm]
-            token_indices = perm // self.topk
+            idx = perm // self.topk
 
             num_local_tokens_per_expert = torch.histc(
                 indices.view(-1),
@@ -502,10 +578,6 @@ class MoE(nn.Module):
                 min=0,
                 max=self.n_routed_experts,
             ).to(torch.int64)
-
-            token_indices = token_indices.reshape(-1, 1).expand(-1, dim)
-
-            routed_input = torch.gather(x_flat, dim=0, index=token_indices)
 
             with torch.no_grad():
                 (
@@ -519,32 +591,34 @@ class MoE(nn.Module):
                     ALIGN_SIZE_M,
                 )
 
-            token_indices = torch.vstack(
-                (token_indices, token_indices.new_zeros((dim)))
-            )
-            token_indices = token_indices[permuted_indices, :]
-
-            routed_input = torch.vstack((routed_input, routed_input.new_zeros((dim))))
-            routed_input = routed_input[permuted_indices, :]
-
-            sorted_weights = torch.cat([sorted_weights, sorted_weights.new_zeros(1)])
-
-            perm_weights = (
-                sorted_weights[permuted_indices].unsqueeze(1)
-                * self.routed_scaling_factor
+            prefill_buffer(
+                routed_input,
+                token_indices,
+                sorted_weights,
+                x_flat,
+                idx,
+                weights,
+                perm,
             )
 
-            routed_output = self.experts(routed_input, m_sizes, m_offset).to(
-                REMIX_DTYPE
-            ) * perm_weights.to(REMIX_DTYPE)
+            routed_input, token_indices, sorted_weights = execute_permute(
+                routed_input,
+                token_indices,
+                sorted_weights,
+                permuted_indices,
+                dim,
+            )
 
-            out = out.scatter_add(dim=0, index=token_indices, src=routed_output)
+            routed_output = self.experts(routed_input, m_sizes, m_offset)
 
-        # Apply shared experts if they exist
-        if self.shared_experts is not None:
-            # Reshape input for shared experts: (n_shared_experts, B*S, dim)
-            shared_output = self.shared_experts(x_flat.unsqueeze(0)).sum(0)
-            out = out + shared_output.to(REMIX_DTYPE)
+            out = mixed_experts_output(
+                out,
+                routed_output,
+                token_indices,
+                sorted_weights,
+                self.routed_scaling_factor,
+                cast_type=REMIX_DTYPE,
+            )
 
         if self.training:
             aux_loss = self.sequence_wise_aux_loss(indices, scores, bz, slen)
@@ -682,6 +756,77 @@ class MoE(nn.Module):
         return aux_loss
 
 
+@torch.compile(fullgraph=True, mode="max-autotune")
+def prepare_qkv(
+    xq, xk, xv, q_norm, k_norm, v_norm, freqs_cis, bs, seqlen, head_dim, n_rep
+):
+    xq = xq.view(bs, seqlen, -1, head_dim)
+    xk = xk.view(bs, seqlen, -1, head_dim)
+    xv = xv.view(bs, seqlen, -1, head_dim)
+    xq = q_norm(xq)
+    xk = k_norm(xk)
+    xv = v_norm(xv)
+
+    xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+    # ! @@@@  dont need kv_cahce for training, but need to bring it back for inference
+    # if self._kv_cache is not None and start_pos >= 0:
+    #     xk, xv = self._kv_cache.update(start_pos, xk, xv)
+
+    # repeat k/v heads if n_kv_heads < n_heads
+    keys = repeat_kv(xk, n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+    values = repeat_kv(xv, n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+
+    xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+    xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+    xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+
+    return xq, xk, xv
+
+
+@torch.compile(fullgraph=True)
+def post_attn_output(output, o_norm, wo, bs, seqlen):
+    output = output.transpose(
+        1, 2
+    ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
+    output = output.view(bs, seqlen, -1)
+    output = o_norm(output)
+    return wo(output)
+
+
+class FusedAttention(Attention):
+    def __init__(self, model_args: MoEModelArgs):
+        super().__init__(model_args)
+
+    @torch.compile(fullgraph=True)
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        start_pos: int = -1,
+    ):
+        bs, seqlen, _ = x.shape
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq, xk, xv = prepare_qkv(
+            xq,
+            xk,
+            xv,
+            self.q_norm,
+            self.k_norm,
+            self.v_norm,
+            freqs_cis,
+            bs,
+            seqlen,
+            self.head_dim,
+            self.n_rep,
+        )
+
+        output = self.sdpa(xq, xk, xv)
+
+        output = post_attn_output(output, self.o_norm, self.wo, bs, seqlen)
+        return output
+
+
 class TransformerBlock(nn.Module):
     """
     TransformerBlock Module
@@ -702,7 +847,7 @@ class TransformerBlock(nn.Module):
 
     """
 
-    attention_cls = Attention
+    attention_cls = FusedAttention
     feed_forward_cls = MoE
 
     def __init__(self, layer_id: int, model_args: MoEModelArgs):
@@ -785,9 +930,16 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention(self.attention_norm(x), freqs_cis)
 
-        mlp_output, moe_aux_loss, routing_entropy = self.feed_forward(self.ffn_norm(h))
+        @torch.compile(fullgraph=True)
+        def norm_x(norm, x):
+            return norm(x)
+
+        h = x + self.attention(norm_x(self.attention_norm, x), freqs_cis)
+
+        mlp_output, moe_aux_loss, routing_entropy = self.feed_forward(
+            norm_x(self.ffn_norm, h)
+        )
 
         out = h + mlp_output
         return out, moe_aux_loss, routing_entropy
