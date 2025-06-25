@@ -90,10 +90,10 @@ class GroupedExperts(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            x (torch.Tensor): with shape (experts_per_rank, tokens_per_expert, dim_in) for Expert Choice(EC).
+            x (torch.Tensor): with shape (total_tokens, dim_in)
 
         Returns:
-            torch.Tensor: with shape (experts_per_rank, tokens_per_expert, dim_in) for Expert Choice(EC).
+            out (torch.Tensor): with shape (total_tokens, dim_in)
         """
 
         h = grouped_gemm(x, reshape_weights(self.gate_proj), m_sizes)

@@ -373,7 +373,7 @@ class SharedExperts(nn.Module):
         init_fn(self.down_proj.weight, mean=0.0, std=gate_init_std)
 
 
-@torch.compile(dynamic=True)
+@torch.compile(fullgraph=True)
 def mixed_experts_output(
     out,
     routed_output,
@@ -382,11 +382,10 @@ def mixed_experts_output(
     scaling_factor,
     cast_type=None,
 ):
-    out = out.scatter_add(
-        dim=0,
-        index=token_indices,
-        src=(routed_output * sorted_weights * scaling_factor).to(cast_type),
-    )
+    src = routed_output * sorted_weights * scaling_factor
+    if cast_type is not None:
+        src = src.to(cast_type)
+    out = out.scatter_add(dim=0, index=token_indices, src=src)
     return out
 
 
@@ -399,13 +398,16 @@ def prefill_buffer(
     idx,
     weights,
     perm,
+    n_tokens,
 ):
-    token_indices[:-1].copy_(idx)
-    sorted_weights[:-1].copy_(weights.view(-1)[perm])
-    routed_input[:-1].copy_(x_flat[idx])
+    """Fill buffers with routed tokens and metadata"""
+    sorted_weights[:n_tokens] = weights.view(-1)[perm]
+    routed_input[:n_tokens] = x_flat[idx]
+    token_indices[:n_tokens] = idx
+    return routed_input, token_indices, sorted_weights
 
 
-@torch.compile(dynamic=True)
+@torch.compile(fullgraph=True)
 def execute_permute(
     routed_input,
     token_indices,
@@ -547,8 +549,8 @@ class MoE(nn.Module):
         bz, slen, dim = x.shape
         x_flat = x.view(bz * slen, dim)
         # TODO@JSC: check if we want to use FP32 remix
-        REMIX_DTYPE = x_flat.dtype
-        # REMIX_DTYPE = torch.float32
+        # REMIX_DTYPE = x_flat.dtype
+        REMIX_DTYPE = torch.float32
 
         if self.shared_experts is not None:
             out = self.shared_experts(x_flat, REMIX_DTYPE)
@@ -576,7 +578,7 @@ class MoE(nn.Module):
                 indices.view(-1),
                 bins=self.n_routed_experts,
                 min=0,
-                max=self.n_routed_experts,
+                max=self.n_routed_experts - 1,
             ).to(torch.int64)
 
             with torch.no_grad():
@@ -591,7 +593,7 @@ class MoE(nn.Module):
                     ALIGN_SIZE_M,
                 )
 
-            prefill_buffer(
+            routed_input, token_indices, sorted_weights = prefill_buffer(
                 routed_input,
                 token_indices,
                 sorted_weights,
@@ -599,6 +601,7 @@ class MoE(nn.Module):
                 idx,
                 weights,
                 perm,
+                total_tokens,
             )
 
             routed_input, token_indices, sorted_weights = execute_permute(
@@ -611,7 +614,7 @@ class MoE(nn.Module):
 
             routed_output = self.experts(routed_input, m_sizes, m_offset)
 
-            out = mixed_experts_output(
+            out += mixed_experts_output(
                 out,
                 routed_output,
                 token_indices,
