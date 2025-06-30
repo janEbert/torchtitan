@@ -423,12 +423,14 @@ class WindowShuffledDataset(IterableDataset, Stateful):
         self._rng.seed(self._initial_seed)
 
     def load_state_dict(self, state_dict):
-        def to_tuple(obj):
+        def list_tree_to_tuple(obj):
             if isinstance(obj, list):
-                return tuple(to_tuple(x) for x in obj)
+                return tuple(list_tree_to_tuple(x) for x in obj)
             return obj
 
-        state_dict["rng_state"] = to_tuple(state_dict["rng_state"])
+        # This should not be required and doesn't pop up during testing,
+        # but we add it for safety.
+        state_dict["rng_state"] = list_tree_to_tuple(state_dict["rng_state"])
 
         self._buffer = state_dict["shuffle_buffer"]
         self._initial_seed = state_dict["initial_seed"]
