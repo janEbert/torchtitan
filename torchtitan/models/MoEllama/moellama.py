@@ -24,11 +24,10 @@ from torchtitan.tools.logging import logger
 from torchtitan.experiments.kernels.moe.indices import generate_permute_indices
 
 from .GroupedExperts import GroupedExperts
+from grouped_gemm.ops import permute, unpermute
 
 # from . import ep_comm # remove EP for debug-run
 from .moe_utils import calc_gate_scaling_factor
-
-ALIGN_SIZE_M = 16
 
 
 @dataclass
@@ -330,9 +329,9 @@ class SharedExperts(nn.Module):
         norm_eps: Optional[float] = None,
     ):
         super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.up_proj = nn.Linear(hidden_dim, dim, bias=False)
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
         self.act_fn = activation
 
         if norm_everywhere:
@@ -344,20 +343,15 @@ class SharedExperts(nn.Module):
             ), "`norm_eps` needs to be passed when `norm_everywhere=True`"
             self.out_norm = build_norm(
                 norm_type,
-                dim=dim,
+                dim=hidden_dim,
                 eps=norm_eps,
             )
         else:
             self.out_norm = nn.Identity()
 
     @torch.compile(fullgraph=True)
-    def forward(self, x, cast_type=None):
-        h = self.act_fn(self.gate_proj(x))
-        h = h * self.down_proj(x)
-        out = self.out_norm(self.up_proj(h))
-        if cast_type is not None:
-            out = out.to(cast_type)
-        return out
+    def forward(self, x):
+        return self.w2(self.out_norm(self.act_fn(self.w1(x)) * self.w3(x)))
 
     def init_weights(
         self,
@@ -367,63 +361,10 @@ class SharedExperts(nn.Module):
         init_fn_type: str,
     ):
         init_fn = build_init_fn(init_fn_type)
-        init_fn(self.gate_proj.weight, mean=0.0, std=init_std)
-        init_fn(self.up_proj.weight, mean=0.0, std=init_std / residual_div)
+        init_fn(self.w1.weight, mean=0.0, std=init_std)
+        init_fn(self.w2.weight, mean=0.0, std=init_std / residual_div)
         gate_init_std = init_std / residual_div if init_gate_as_residual else init_std
-        init_fn(self.down_proj.weight, mean=0.0, std=gate_init_std)
-
-
-@torch.compile(fullgraph=True)
-def mixed_experts_output(
-    out,
-    routed_output,
-    token_indices,
-    sorted_weights,
-    scaling_factor,
-    cast_type=None,
-):
-    src = routed_output * sorted_weights * scaling_factor
-    if cast_type is not None:
-        src = src.to(cast_type)
-    out = out.scatter_add(dim=0, index=token_indices, src=src)
-    return out
-
-
-@torch.compile(fullgraph=True, mode="reduce-overhead")
-def prefill_buffer(
-    routed_input,
-    token_indices,
-    sorted_weights,
-    x_flat,
-    idx,
-    weights,
-    perm,
-    n_tokens,
-):
-    """Fill buffers with routed tokens and metadata"""
-    sorted_weights[:n_tokens] = weights.view(-1)[perm]
-    routed_input[:n_tokens] = x_flat[idx]
-    token_indices[:n_tokens] = idx
-    return routed_input, token_indices, sorted_weights
-
-
-@torch.compile(fullgraph=True)
-def execute_permute(
-    routed_input,
-    token_indices,
-    sorted_weights,
-    permuted_indices,
-    dim,
-):
-    routed_input = routed_input[permuted_indices, :]
-    token_indices = token_indices[permuted_indices]
-    sorted_weights = sorted_weights[permuted_indices]
-
-    return (
-        routed_input,
-        token_indices.reshape(-1, 1).expand(-1, dim),
-        sorted_weights.unsqueeze(1),
-    )
+        init_fn(self.w3.weight, mean=0.0, std=gate_init_std)
 
 
 class MoE(nn.Module):
@@ -472,6 +413,8 @@ class MoE(nn.Module):
             "routed_scaling_factor",
             torch.tensor(routed_scaling_factor, dtype=torch.float32),
         )
+        self.routed_scaling_factor_value = routed_scaling_factor
+
         # Use updated Gate with DeepSeekMoE-style routing and bias balancing
         self.gate = Gate(
             hidden_size=dim,
@@ -507,7 +450,7 @@ class MoE(nn.Module):
         if n_routed_experts > 0:
             self.experts = GroupedExperts(
                 dim_in=dim,
-                dim_out=hidden_dim,
+                dim_hidden=hidden_dim,
                 num_experts=n_routed_experts,
                 moe_init_all_experts_same=moe_init_all_experts_same,
                 norm_everywhere=norm_everywhere,
@@ -541,6 +484,7 @@ class MoE(nn.Module):
                 init_fn_type=init_fn_type,
             )
         self.gate.init_weights(init_std, router_init_fn_type)
+        self.routed_scaling_factor.data = torch.tensor(self.routed_scaling_factor_value)
 
     def update_gate_bias(self):
         self.gate.update()
@@ -549,79 +493,30 @@ class MoE(nn.Module):
         bz, slen, dim = x.shape
         x_flat = x.view(bz * slen, dim)
         # TODO@JSC: check if we want to use FP32 remix
-        # REMIX_DTYPE = x_flat.dtype
-        REMIX_DTYPE = torch.float32
 
         if self.shared_experts is not None:
-            out = self.shared_experts(x_flat, REMIX_DTYPE)
+            out = self.shared_experts(x_flat)
         else:
-            out = torch.zeros(x_flat.shape, device=x_flat.device, dtype=REMIX_DTYPE)
+            out = torch.zeros(x_flat.shape, device=x_flat.device, dtype=x_flat.dtype)
 
         total_tokens = bz * slen * self.topk
-        routed_input = torch.zeros(
-            total_tokens + 1, dim, device=x_flat.device, dtype=x_flat.dtype
-        )
-        token_indices = torch.zeros(
-            total_tokens + 1, dtype=torch.int64, device=x_flat.device
-        )
-        sorted_weights = torch.zeros(
-            total_tokens + 1, dtype=torch.float32, device=x_flat.device
-        )
 
         if self.topk > 0:
             # (B*S, K), (B*S, K)
             weights, indices, scores = self.gate(x_flat)
-            perm = torch.argsort(indices.view(-1), stable=True)
-            idx = perm // self.topk
 
-            num_local_tokens_per_expert = torch.histc(
-                indices.view(-1),
-                bins=self.n_routed_experts,
-                min=0,
-                max=self.n_routed_experts - 1,
-            ).to(torch.int64)
+            permuted_inputs, row_id_map = permute(x_flat, indices.to(torch.int32))
 
-            with torch.no_grad():
-                (
-                    permuted_indices,
-                    m_sizes,
-                    m_offset,
-                ) = generate_permute_indices(
-                    num_local_tokens_per_expert,
-                    self.experts.expert_per_rank,
-                    self.experts.ep_size,
-                    ALIGN_SIZE_M,
-                )
+            m_sizes = torch.bincount(indices.view(-1), minlength=self.n_routed_experts)
 
-            routed_input, token_indices, sorted_weights = prefill_buffer(
-                routed_input,
-                token_indices,
-                sorted_weights,
-                x_flat,
-                idx,
-                weights,
-                perm,
-                total_tokens,
+            output = self.experts(permuted_inputs, m_sizes.long().cpu())
+
+            print(f"routed_scaling_factor: {self.routed_scaling_factor}")
+            routed_output = unpermute(
+                output, row_id_map, weights * self.routed_scaling_factor
             )
 
-            routed_input, token_indices, sorted_weights = execute_permute(
-                routed_input,
-                token_indices,
-                sorted_weights,
-                permuted_indices,
-                dim,
-            )
-
-            routed_output = self.experts(routed_input, m_sizes, m_offset)
-
-            out += mixed_experts_output(
-                out,
-                routed_output,
-                token_indices,
-                sorted_weights,
-                self.routed_scaling_factor,
-                cast_type=REMIX_DTYPE,
-            )
+            out += routed_output
 
         if self.training:
             aux_loss = self.sequence_wise_aux_loss(indices, scores, bz, slen)
@@ -871,6 +766,9 @@ class TransformerBlock(nn.Module):
                 )
         else:
             routed_scaling_factor = model_args.moe_routed_scaling_factor
+            logger.info(
+                f"Using manually set routed_scaling_factor: {routed_scaling_factor}"
+            )
 
         self.feed_forward = self.feed_forward_cls(
             dim=model_args.dim,

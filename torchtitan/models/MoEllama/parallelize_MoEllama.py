@@ -426,8 +426,6 @@ def apply_compile(model: nn.Module):
         # transformer_block = torch.compile(transformer_block, dynamic=True)
         import torch._dynamo as dynamo
 
-        torch._dynamo.config.capture_scalar_outputs = True
-        torch._dynamo.config.capture_dynamic_output_shape_ops = True
         torch._dynamo.config.suppress_errors = True
         transformer_block = torch.compile(
             transformer_block, dynamic=False, mode="max-autotune"
