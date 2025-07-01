@@ -204,6 +204,120 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
         # else:
         #     do nothing; this rank's output has been all-gathered
 
+    def _dummy_pad_inputs(self, inputs):
+        batch_size = inputs.shape[0]
+        # Which elements are dummies? 0 if dummy, 1 if not.
+        dummy_mask = torch.ones(batch_size, dtype=torch.bool)
+        if self.server.parallel_dims.dp_enabled:
+            # dp_group = self.server.get_group("dp")
+            dp_size = self.server.get_group_size("dp")
+            if batch_size % dp_size != 0:
+                pad_size = dp_size - (batch_size % dp_size)
+                assert pad_size > 0
+                inputs = torch.cat([inputs, torch.empty(
+                    (pad_size,) + inputs.shape[1:],
+                    dtype=inputs[0].dtype,
+                    device=inputs[0].device,
+                )])
+                new_batch_size = inputs.shape[0]
+                assert new_batch_size % dp_size == 0
+                dummy_mask[:-pad_size] = 0
+        return inputs, dummy_mask
+
+    # Root: global rank = 0, dp = 0, tp = 0, etc.
+    #
+    # Root --+-- dp=0 -- tp, pp, ...
+    #        | <-- shard
+    #        +-- dp=1 -- tp, pp, ...
+    #        |
+    #       ...
+    #        |
+    #        +-- dp=n -- tp, pp, ...
+    def _shard_inputs(self, inputs):
+        # This function is written as if it was executed by all
+        # processes, even though it is not. This is just to make its
+        # semantics more clear.
+        batch_size = inputs.shape[0]
+
+        batch_size_tensor = torch.tensor(batch_size, dtype=torch.int64)
+        torch.distributed.broadcast(batch_size_tensor, src=0)
+        batch_size = batch_size_tensor.item()
+
+        if inputs.ndim <= 1:
+            seq_len = 0
+        else:
+            seq_len = inputs.shape[1]
+        seq_len_tensor = torch.tensor(seq_len, dtype=torch.int64)
+        torch.distributed.broadcast(seq_len_tensor, src=0)
+        seq_len = seq_len_tensor.item()
+
+        if self.server.parallel_dims.dp_enabled:
+            dp_group = self.server.get_group("dp")
+            dp_size = self.server.get_group_size("dp")
+            dp_rank = self.server.get_group_rank("dp")
+
+            assert batch_size % dp_size == 0, \
+                "dummy samples have not been added or amount was incorrect"
+            sharded_batch_size = batch_size // dp_size
+            sharded_inputs_shape = (
+                (sharded_batch_size,)
+                if seq_len == 0
+                else (sharded_batch_size, seq_len)
+            )
+
+            # We'd need to also broadcast `seq_len` here if we let each
+            # rank have its own server.
+
+            if dp_rank == 0:
+                send_ops = []
+                for recv_dp_rank in range(1, dp_size):
+                    shard_start = recv_dp_rank * sharded_batch_size
+                    shard_end = shard_start + sharded_batch_size
+                    out_tensor = inputs[shard_start:shard_end]
+                    assert out_tensor.shape == sharded_inputs_shape
+
+                    send_op = torch.distributed.isend(
+                        out_tensor,
+                        group_dst=recv_dp_rank,
+                        group=dp_group,
+                    )
+                    send_ops.append(send_op)
+
+                # Block until all sends are completed.
+                for send_op in send_ops:
+                    send_op.wait()
+
+                # Get local `out_tensor`
+                out_tensor = inputs[:sharded_batch_size]
+            else:
+                out_tensor = torch.empty(
+                    sharded_inputs_shape,
+                    dtype=inputs.dtype,
+                    device=inputs.device,
+                )
+                torch.distributed.irecv(out_tensor, group_src=0, group=dp_group)
+
+            inputs = out_tensor
+            del out_tensor
+
+        if self.server.parallel_dims.cp_enabled:
+            cp_group = self.server.get_group("cp")
+            torch.distributed.broadcast(inputs, group=cp_group, group_src=0)
+
+        if self.server.parallel_dims.tp_enabled:
+            tp_group = self.server.get_group("tp")
+            torch.distributed.broadcast(inputs, group=tp_group, group_src=0)
+
+        if self.server.parallel_dims.pp_enabled:
+            pp_group = self.server.get_group("pp")
+            torch.distributed.broadcast(inputs, group=pp_group, group_src=0)
+
+        if self.server.parallel_dims.ep_enabled:
+            ep_group = self.server.get_group("ep")
+            torch.distributed.broadcast(inputs, group=ep_group, group_src=0)
+
+        return inputs
+
     # TODO spread/broadcast/shard/duplicate inputs depending on their batch size and DP size
     # TODO also remove "finished" samples; can heuristically just check last seq elem for EOS token
     def _distribute_inputs(self, input_dict):
@@ -211,6 +325,9 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
         start_pos = input_dict.get("start_pos", 0)
         assert not isinstance(start_pos, torch.Tensor), \
             'multiple start positions currently not supported'
+        start_pos_tensor = torch.tensor(start_pos, dtype=torch.int64)
+        torch.distributed.broadcast(start_pos_tensor, src=0)
+        start_pos = start_pos_tensor.item()
         sharded_input_dict = input_dict.copy()
 
         inputs = self._normalize_inputs(inputs)
@@ -223,27 +340,26 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
         # longtensor start pos END
 
         inputs, first_seq_elem_indices, orig_seq_lens = self._to_token_tensor(inputs, start_pos)
-        # TODO not sharded
-        sharded_input_dict["input"] = inputs
+        inputs, dummy_mask = self._dummy_pad_inputs(inputs)
+        sharded_input_dict["input"] = self._shard_inputs(inputs)
 
         # Move to device
         self._to_device(sharded_input_dict, self.server.device)
 
-        # TODO not sharded
-        sharded_input_dict["first_seq_elem_indices"] = first_seq_elem_indices
+        first_seq_elem_indices, _ = self._dummy_pad_inputs(first_seq_elem_indices)
+        sharded_input_dict["first_seq_elem_indices"] = self._shard_inputs(first_seq_elem_indices)
 
         # List of indices that contain "actual" outputs, i.e., outputs
         # that were not duplicated.
-        output_indices = []
+        # dummy_mask = self._shard_inputs(dummy_mask)
+        # output_indices = torch.nonzero(dummy_mask).tolist()
 
-        pass  # TODO
+        return sharded_input_dict, dummy_mask
+        # return sharded_input_dict, output_indices
 
-        return sharded_input_dict, output_indices
-
-    # TODO only select outputs that this process needs
-    def _select_outputs(self, output_dict, output_indices):
-        pass  # TODO
-        return output_dict
+    def _select_outputs(self, output_dict, dummy_mask):
+    # def _select_outputs(self, output_dict, output_indices):
+        return output_dict[dummy_mask]
 
     def _normalize_inputs(self, inputs):
         if not isinstance(inputs, list):
@@ -318,7 +434,8 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
         return input_dict
 
     def serve_step(self, input_dict: dict[str, Any], logits_only: bool):
-        input_dict, output_indices = self._distribute_inputs(input_dict)
+        input_dict, dummy_mask = self._distribute_inputs(input_dict)
+        # input_dict, output_indices = self._distribute_inputs(input_dict)
 
         inputs = input_dict["input"]
         start_pos = input_dict.get("start_pos", 0)
@@ -352,6 +469,9 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
         logger.debug(f"{outputs = }")
 
         if outputs is not None:
+            # Remove outputs for dummy inputs
+            outputs = outputs[dummy_mask]
+
             # Update start position to make it easy on users.
             # TODO with the `+ len(outputs) - 1` terms, we want to handle
             #      MTP; however, does KV caching work with it? probably
@@ -447,7 +567,8 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
                 input_tokens=input_tokens,
             ))
 
-            output_dict = self._select_outputs(output_dict, output_indices)
+            # output_dict = self._select_outputs(output_dict, dummy_mask)
+            # output_dict = self._select_outputs(output_dict, output_indices)
         else:
             output_dict = None
 
@@ -554,22 +675,100 @@ class TorchTitanServer(TCPServer):
         else:
             dp_rank = 0
         self.init_serving()
-        if dp_rank >= 0:
+        # if dp_rank >= 0:
+        if dp_rank == 0:
             self.start_server(address, port)
             logger.info(f"Serving model at {address}:{port}.")
             self.serve_forever(poll_interval)
         else:
             while True:
                 self.before_process_request()
-                # input_dict = torch.gather TODO???
-                # TODO remove line below
-                input_dict = dict(input=torch.empty(2, 2, 2).to(self.device))
+                input_dict = self.wait_for_inputs()
                 outputs = self.forward_and_gather(input_dict)
                 assert outputs is None
                 self.after_process_request()
 
+    def _receive_inputs(self):
+        batch_size_tensor = torch.empty((), dtype=torch.int64)
+        torch.distributed.broadcast(batch_size_tensor, src=0)
+        batch_size = batch_size_tensor.item()
+
+        seq_len_tensor = torch.empty((), dtype=torch.int64)
+        torch.distributed.broadcast(seq_len_tensor, src=0)
+        seq_len = seq_len_tensor.item()
+
+        # Hardcode these because doing it another way would be
+        # really annoying.
+        # We just expect dtype to always be long here and device to be
+        # default (i.e., usually CPU).
+        inputs_dtype = torch.long
+        inputs_device = None
+
+        if self.server.parallel_dims.dp_enabled:
+            dp_group = self.server.get_group("dp")
+            dp_size = self.server.get_group_size("dp")
+            dp_rank = self.server.get_group_rank("dp")
+
+            assert batch_size % dp_size == 0
+            sharded_batch_size = batch_size // dp_size
+            sharded_inputs_shape = (
+                (sharded_batch_size,)
+                if seq_len == 0
+                else (sharded_batch_size, seq_len)
+            )
+
+            # We'd need to also broadcast `seq_len` here if we let each
+            # rank have its own server.
+
+            if dp_rank != 0:
+                inputs = torch.empty(
+                    sharded_inputs_shape,
+                    dtype=inputs_dtype,
+                    device=inputs_device,
+                )
+                torch.distributed.irecv(inputs, group_src=0, group=dp_group)
+            else:
+                raise RuntimeError("this path should not be reached")
+        else:
+            inputs_shape = (
+                (batch_size,)
+                if seq_len == 0
+                else (batch_size, seq_len)
+            )
+            inputs = torch.empty(
+                inputs_shape,
+                dtype=inputs_dtype,
+                device=inputs_device,
+            )
+
+        if self.server.parallel_dims.cp_enabled:
+            cp_group = self.server.get_group("cp")
+            torch.distributed.broadcast(inputs, group=cp_group, group_src=0)
+
+        if self.server.parallel_dims.tp_enabled:
+            tp_group = self.server.get_group("tp")
+            torch.distributed.broadcast(inputs, group=tp_group, group_src=0)
+
+        if self.server.parallel_dims.pp_enabled:
+            pp_group = self.server.get_group("pp")
+            torch.distributed.broadcast(inputs, group=pp_group, group_src=0)
+
+        if self.server.parallel_dims.ep_enabled:
+            ep_group = self.server.get_group("ep")
+            torch.distributed.broadcast(inputs, group=ep_group, group_src=0)
+
+        return inputs
+
     def wait_for_inputs(self):
-        # input_dict = torch.gather TODO???
+        input_dict = {}
+
+        start_pos_tensor = torch.empty((), dtype=torch.int64)
+        torch.distributed.broadcast(start_pos_tensor, src=0)
+        start_pos = start_pos_tensor.item()
+
+        input_dict["start_pos"] = start_pos
+        input_dict["input"] = self._receive_inputs()
+        input_dict["first_seq_elem_indices"] = self._receive_inputs()
         return input_dict
 
     def before_process_request(self):
