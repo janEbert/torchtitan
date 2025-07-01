@@ -48,7 +48,7 @@ def parse_args(args_list: list[str] | None = None):
     )
     parser.add_argument(
         "--checkpoint_folder",
-        help="Path to the folder containing the checkpoint files to convert.",
+        help="Path to the folder containing the checkpoint file to use.",
     )
     parser.add_argument(
         "--job_config_file",
