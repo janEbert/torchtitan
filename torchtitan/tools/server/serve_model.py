@@ -807,7 +807,11 @@ class TorchTitanServer(TCPServer):
             world_size=world_size,
             enable_loss_parallel=not parallelism_config.disable_loss_parallel,
         )
+        # We want CPU to be available.
+        old_enable_cpu_offload = job_config.training.enable_cpu_offload
+        job_config.training.enable_cpu_offload = True
         dist_utils.init_distributed(job_config, self.device)
+        job_config.training.enable_cpu_offload = old_enable_cpu_offload
 
         # build meshes
         self.world_mesh = world_mesh = parallel_dims.build_mesh(device_type=device_type)
