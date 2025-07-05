@@ -18,6 +18,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
     StateDictOptions,
 )
+import torch.distributed as dist
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate
@@ -28,6 +29,7 @@ from torchtitan.config_manager import JobConfig
 from torchtitan.optimizers import DistributedScion, Scion
 from torchtitan.optimizers.muon_utils import zeropower_backends
 from torchtitan.tools.logging import logger
+
 
 __all__ = [
     "OptimizersContainer",
@@ -160,33 +162,35 @@ def _extract_param_groups(
     return params
 
 
-import torch.distributed as dist
-from collections import defaultdict
-
-
 def gather_and_merge(local_stats: dict, dst: int = 0):
     world = dist.get_world_size()
     rank = dist.get_rank()
     dtype = torch.bfloat16
 
     my_keys = list(local_stats.keys())
-    key_bucket: List[Any] | None = [None] * world if rank == dst else None
+
+    if len(my_keys) > 0:
+        val_tensor = torch.stack([local_stats[k].to(dtype) for k in my_keys])
+    else:
+        my_keys = "padding"
+        val_tensor = None
+
+    key_bucket = [None] * world if rank == dst else None
+    val_bucket = [None] * world if rank == dst else None
+
     dist.gather_object(my_keys, key_bucket, dst=dst)
-    dist.barrier()
-
-    val_tensor = torch.stack([local_stats[k].to(dtype) for k in my_keys])
-
-    gather_list = (
-        [torch.empty_like(val_tensor) for _ in range(world)] if rank == dst else None
-    )
-    dist.gather(val_tensor, gather_list=gather_list, dst=dst)
+    # dist.barrier()
+    dist.gather_object(val_tensor, val_bucket, dst=dst)
     dist.barrier()
 
     merged = {}
     if rank == dst:
         for peer, keys in enumerate(key_bucket):
-            for k, v in zip(keys, gather_list[peer]):
-                merged[k] = v
+            if val_bucket[peer] is None:
+                continue
+            for k, v in zip(keys, val_bucket[peer]):
+                if k != "padding":
+                    merged[k] = v
 
     dist.barrier()
     if rank == dst:
@@ -326,11 +330,13 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                 momentum,
                 nesterov,
                 update_buffer=False,
-                gather_to_local=optimizer.fsdp_enabled,
+                gather_to_local=optimizer.fsdp_enabled and p.ndim < 3,
+                # we do not gather the moe's grads
             )
             if g is None:
                 return None
             else:
+                g = g.to_local() if isinstance(g, DTensor) else g
                 return optimizer.lmo(g, **kwargs)
         elif isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
             if p.ndim == 3:
@@ -422,7 +428,7 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
                             FLAG_NEED_SYNC = True
                             local_rank = dist.get_rank()
                             world_size = dist.get_world_size()
-                            ep_per_rank = p.shape[0] // world_size
+                            ep_per_rank = math.ceil(p.shape[0] / world_size)
                             # We dont gather the parameters for 3D tensors, which is [G, D_in, D_out] of GroupedExperts
                             pass
                         p = p.to_local() if isinstance(p, DTensor) else p
