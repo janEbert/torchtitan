@@ -591,8 +591,10 @@ class TorchTitanServer(TCPServer):
             bind_and_activate=False,
         )
         self.init_model(job_config, max_batch_size, max_seq_length)
+        logger.debug("Initialized server model")
         if checkpoint_folder:
             self.load_model(checkpoint_folder)
+            logger.debug(f"Loaded server model from `{checkpoint_folder}`")
         self.is_serving = False
         self.logits_only = None
 
