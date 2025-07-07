@@ -313,7 +313,8 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
                     dtype=inputs.dtype,
                     device=inputs.device,
                 )
-                torch.distributed.irecv(out_tensor, group_src=0, group=dp_group)
+                recv_op = torch.distributed.irecv(out_tensor, group_src=0, group=dp_group)
+                recv_op.wait()
 
             inputs = out_tensor
             del out_tensor
@@ -749,7 +750,8 @@ class TorchTitanServer(TCPServer):
                     dtype=inputs_dtype,
                     device=inputs_device,
                 )
-                torch.distributed.irecv(inputs, group_src=0, group=dp_group)
+                recv_op = torch.distributed.irecv(inputs, group_src=0, group=dp_group)
+                recv_op.wait()
             else:
                 raise RuntimeError("this path should not be reached")
         else:
