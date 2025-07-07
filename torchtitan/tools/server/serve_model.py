@@ -210,6 +210,7 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
         logger.debug(f"Received request from {self.client_address[0]}.")
         logger.debug(f"{self.client_address[0]}: {input_dict}")
 
+        self.server.before_process_request()
         output_dict = self.serve_step(input_dict, logits_only=self.server.logits_only)
 
         if output_dict is not None:
@@ -219,6 +220,7 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
             send_data(data, self.request, self.MAX_SEND_DATA_BYTES, self.DATA_BYTES_PER_PIECE)
         # else:
         #     do nothing; this rank's output has been all-gathered
+        self.server.after_process_request()
 
     def _dummy_pad_inputs(self, inputs):
         batch_size = inputs.shape[0]
@@ -798,11 +800,6 @@ class TorchTitanServer(TCPServer):
         print("passed before barrier")
         self.step += 1
         self.gc_handler.run(self.step)
-
-    def process_request(self, request, client_address):
-        self.before_process_request()
-        super().process_request(request, client_address)
-        self.after_process_request()
 
     def after_process_request(self):
         print("waiting for after barrier")
