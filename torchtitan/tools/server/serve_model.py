@@ -1183,6 +1183,7 @@ def main(args_list: list[str] | None = None):
     with open(job_config_file, "r") as f:
         job_config_dict = json.load(f)
     job_config = JobConfig()
+    job_config.args_dict = job_config_dict
     for (k, v) in job_config_dict.items():
         class_type = type(k.title(), (), v)
         setattr(job_config, k, class_type())
