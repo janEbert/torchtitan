@@ -224,8 +224,8 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
 
     def _dummy_pad_inputs(self, inputs):
         batch_size = inputs.shape[0]
+        pad_size = 0
         # Which elements are dummies? 0 if dummy, 1 if not.
-        dummy_mask = torch.ones(batch_size, dtype=torch.bool)
         if self.server.parallel_dims.dp_enabled:
             # dp_group = self.server.get_group("dp")
             dp_size = self.server.get_group_size("dp")
@@ -240,7 +240,9 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
                 )])
                 new_batch_size = inputs.shape[0]
                 assert new_batch_size % dp_size == 0
-                dummy_mask[:-pad_size] = 0
+        dummy_mask = torch.ones(inputs.shape[0], dtype=torch.bool)
+        if pad_size > 0:
+            dummy_mask[:-pad_size] = 0
         return inputs, dummy_mask
 
     # Root: global rank = 0, dp = 0, tp = 0, etc.
