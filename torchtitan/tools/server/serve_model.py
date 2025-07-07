@@ -503,8 +503,11 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
             # longtensor start pos END
 
             logger.debug(f"logits shape: {outputs.shape}")
+            # Remove vocabulary padding
+            outputs = outputs[:, :, :self.server.tokenizer.n_words]
+            output_logits = outputs.tolist()
             # Calculate probabilities
-            outputs = outputs[:, -1:, :self.server.tokenizer.n_words]
+            outputs = outputs[:, -1:, :]
             logger.debug(f"filtered logits shape: {outputs.shape}")
 
             # Optionally de-tokenize
@@ -516,7 +519,6 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
                 seed = rng.initial_seed()
                 sampling_params["seed"] = seed
 
-                output_logits = outputs.tolist()
                 output_probs = logits_to_probs(
                     outputs[:, -1, :],
                     temperature=sampling_params["temperature"],
@@ -543,7 +545,7 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
                 )
             else:
                 output_dict = dict(
-                    output_logits=outputs.tolist(),
+                    output_logits=output_logits,
                 )
 
             input_tokens = input_dict["input"].tolist()
