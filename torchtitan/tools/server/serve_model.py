@@ -1168,6 +1168,11 @@ def main(args_list: list[str] | None = None):
             os.listdir(args.dump_folder),
         ))
 
+        if not job_config_files:
+            raise RuntimeError(
+                "Found no job config file in dump folder, so cannot continue. "
+                "Use `--job_config_file` to specify a specific one if it's located elsewhere."
+            )
         job_config_file = os.path.join(args.dump_folder, job_config_files[-1])
         if len(job_config_files) > 1:
             warnings.warn(
