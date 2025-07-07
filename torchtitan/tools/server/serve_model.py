@@ -73,7 +73,7 @@ def parse_args(args_list: list[str] | None = None):
         "--server_port",
         default=DEFAULT_PORT,
         type=int,
-        nargs='*',
+        nargs="*",
         help="Port to host the server on.",
     )
     parser.add_argument(
@@ -151,7 +151,7 @@ def decode_data(data: bytes):
 
 
 def encode_data(data):
-    data = json.dumps(data, separators=(',', ':'))
+    data = json.dumps(data, separators=(",", ":"))
     data = data.encode()
     data = zlib.compress(data)
     data = base64.b64encode(data)
@@ -346,7 +346,7 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
         inputs = input_dict["input"]
         start_pos = input_dict.get("start_pos", 0)
         assert not isinstance(start_pos, torch.Tensor), \
-            'multiple start positions currently not supported'
+            "multiple start positions currently not supported"
         start_pos_tensor = torch.tensor(start_pos, dtype=torch.int64)
         torch.distributed.broadcast(start_pos_tensor, src=0)
         start_pos = start_pos_tensor.item()
@@ -462,7 +462,7 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
         inputs = input_dict["input"]
         start_pos = input_dict.get("start_pos", 0)
         assert not isinstance(start_pos, (torch.Tensor, list)), \
-            'multiple start positions currently not supported'
+            "multiple start positions currently not supported"
         sampling_params = dict(
             seed=input_dict.pop("seed", None),
             temperature=input_dict.pop("temperature", 1.0),
