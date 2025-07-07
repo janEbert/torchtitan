@@ -232,8 +232,9 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
             if batch_size % dp_size != 0:
                 pad_size = dp_size - (batch_size % dp_size)
                 assert pad_size > 0
-                inputs = torch.cat([inputs, torch.empty(
+                inputs = torch.cat([inputs, torch.full(
                     (pad_size,) + inputs.shape[1:],
+                    self.server.tokenizer.pad_id,
                     dtype=inputs[0].dtype,
                     device=inputs[0].device,
                 )])
