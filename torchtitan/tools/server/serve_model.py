@@ -1264,13 +1264,14 @@ def main(args_list: list[str] | None = None):
             args.max_seq_length,
         )
         server.serve(args.server_address, args.server_port, logits_only=not args.do_sampling)
-    finally:
+    except Exception:
         if server:
             server.close()
-
-        if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
-            logger.info("Process group destroyed.")
+        raise
+    else:
+        server.close()
+        torch.distributed.destroy_process_group()
+        logger.info("Process group destroyed.")
 
 
 if __name__ == "__main__":
