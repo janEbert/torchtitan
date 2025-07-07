@@ -201,6 +201,11 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
             logger.warn(
                 f"Error during data decoding; ignoring packet with content: {data}"
             )
+            msg = (
+                b"unexpected data format; please use "
+                b"`torchtitan.tools.server.serve_model.encode_data` to encode data before sending"
+            )
+            send_data(msg, self.request, self.MAX_SEND_DATA_BYTES, self.DATA_BYTES_PER_PIECE)
             return
         logger.debug(f"Received request from {self.client_address[0]}.")
         logger.debug(f"{self.client_address[0]}: {input_dict}")
