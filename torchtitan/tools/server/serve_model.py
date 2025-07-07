@@ -727,10 +727,10 @@ class TorchTitanServer(TCPServer):
         inputs_dtype = torch.long
         inputs_device = None
 
-        if self.server.parallel_dims.dp_enabled:
-            dp_group = self.server.get_group("dp")
-            dp_size = self.server.get_group_size("dp")
-            dp_rank = self.server.get_group_rank("dp")
+        if self.parallel_dims.dp_enabled:
+            dp_group = self.get_group("dp")
+            dp_size = self.get_group_size("dp")
+            dp_rank = self.get_group_rank("dp")
 
             assert batch_size % dp_size == 0
             sharded_batch_size = batch_size // dp_size
@@ -764,20 +764,20 @@ class TorchTitanServer(TCPServer):
                 device=inputs_device,
             )
 
-        if self.server.parallel_dims.cp_enabled:
-            cp_group = self.server.get_group("cp")
+        if self.parallel_dims.cp_enabled:
+            cp_group = self.get_group("cp")
             torch.distributed.broadcast(inputs, group=cp_group, group_src=0)
 
-        if self.server.parallel_dims.tp_enabled:
-            tp_group = self.server.get_group("tp")
+        if self.parallel_dims.tp_enabled:
+            tp_group = self.get_group("tp")
             torch.distributed.broadcast(inputs, group=tp_group, group_src=0)
 
-        if self.server.parallel_dims.pp_enabled:
-            pp_group = self.server.get_group("pp")
+        if self.parallel_dims.pp_enabled:
+            pp_group = self.get_group("pp")
             torch.distributed.broadcast(inputs, group=pp_group, group_src=0)
 
-        if self.server.parallel_dims.ep_enabled:
-            ep_group = self.server.get_group("ep")
+        if self.parallel_dims.ep_enabled:
+            ep_group = self.get_group("ep")
             torch.distributed.broadcast(inputs, group=ep_group, group_src=0)
 
         return inputs
