@@ -1197,6 +1197,11 @@ def main(args_list: list[str] | None = None):
             os.listdir(checkpoint_parent_folder),
         ))
 
+        if not checkpoint_folders:
+            raise RuntimeError(
+                "Found no checkpoint folder in dump folder, so cannot continue. "
+                "Use `--checkpoint_folder` to specify a specific one if it's located elsewhere."
+            )
         checkpoint_folder = os.path.join(checkpoint_parent_folder, checkpoint_folders[-1])
         if len(checkpoint_folders) > 1:
             warnings.warn(
