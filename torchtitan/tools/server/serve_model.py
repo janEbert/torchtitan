@@ -596,12 +596,7 @@ class TorchTitanServer(TCPServer):
             TorchTitanServerRequestHandler,
             bind_and_activate=False,
         )
-        self.init_model(
-            job_config,
-            max_batch_size,
-            max_seq_length,
-            new_dump_folder,
-        )
+        self.init_model(job_config, max_batch_size, max_seq_length, new_dump_folder)
         logger.debug("Initialized server model")
         if checkpoint_folder:
             self.load_model(checkpoint_folder)
