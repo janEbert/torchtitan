@@ -60,6 +60,11 @@ def parse_args(args_list: list[str] | None = None):
     # )
 
     parser.add_argument(
+        "--new_dump_folder",
+        help="Where to dump outputs created during serving.",
+    )
+
+    parser.add_argument(
         "--server_address",
         default="localhost",
         help="Address to host the server on.",
@@ -584,13 +589,19 @@ class TorchTitanServer(TCPServer):
             checkpoint_folder: str | None = None,
             max_batch_size: int = 8,
             max_seq_length: int = 4096,
+            new_dump_folder: str | None = None,
     ):
         super().__init__(
             ("localhost", DEFAULT_PORT),
             TorchTitanServerRequestHandler,
             bind_and_activate=False,
         )
-        self.init_model(job_config, max_batch_size, max_seq_length)
+        self.init_model(
+            job_config,
+            max_batch_size,
+            max_seq_length,
+            new_dump_folder,
+        )
         logger.debug("Initialized server model")
         if checkpoint_folder:
             self.load_model(checkpoint_folder)
@@ -979,7 +990,13 @@ class TorchTitanServer(TCPServer):
 
         return pred
 
-    def init_model(self, job_config: JobConfig, max_batch_size: int, max_seq_length: int):
+    def init_model(
+            self,
+            job_config: JobConfig,
+            max_batch_size: int,
+            max_seq_length: int,
+            new_dump_folder: str | None,
+    ):
         self.job_config = job_config
 
         if job_config.experimental.custom_import:
@@ -1051,7 +1068,12 @@ class TorchTitanServer(TCPServer):
             if self.train_spec.build_metrics_processor_fn is None
             else self.train_spec.build_metrics_processor_fn
         )
+        # Use separate dump folder for logging.
+        old_dump_folder = job_config.job.dump_folder
+        if new_dump_folder is not None:
+            job_config.job.dump_folder = new_dump_folder
         self.metrics_processor = build_metrics_processor_fn(job_config, parallel_dims)
+        job_config.job.dump_folder = old_dump_folder
         color = self.metrics_processor.color
 
         # calculate model size and flops per token
@@ -1262,6 +1284,7 @@ def main(args_list: list[str] | None = None):
             checkpoint_folder,
             args.max_batch_size,
             args.max_seq_length,
+            args.new_dump_folder,
         )
         server.serve(args.server_address, args.server_port, logits_only=not args.do_sampling)
     except Exception:
