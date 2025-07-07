@@ -709,7 +709,8 @@ class TorchTitanServer(TCPServer):
             while True:
                 self.before_process_request()
                 input_dict = self.wait_for_inputs()
-                outputs = self.forward_and_gather(input_dict)
+                first_seq_elem_indices = input_dict.pop("first_seq_elem_indices")
+                outputs = self.forward_and_gather(input_dict, first_seq_elem_indices)
                 assert outputs is None
                 self.after_process_request()
 
