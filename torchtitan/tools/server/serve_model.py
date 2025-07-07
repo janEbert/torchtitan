@@ -195,7 +195,13 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
 
     def handle(self):
         data = receive_data(self.request, self.MAX_RECV_DATA_BYTES, self.DATA_BYTES_PER_PIECE)
-        input_dict = decode_data(data)
+        try:
+            input_dict = decode_data(data)
+        except Exception:
+            logger.warn(
+                f"Error during data decoding; ignoring packet with content: {data}"
+            )
+            return
         logger.debug(f"Received request from {self.client_address[0]}.")
         logger.debug(f"{self.client_address[0]}: {input_dict}")
 
