@@ -891,7 +891,7 @@ class TorchTitanServer(TCPServer):
                 if cp_group_rank == 0:
                     gather_list = [
                         torch.empty_like(outputs)
-                        for _ in self.get_group_size("cp")
+                        for _ in range(self.get_group_size("cp"))
                     ]
 
                 torch.distributed.gather(
@@ -916,7 +916,7 @@ class TorchTitanServer(TCPServer):
                 if dp_group_rank == 0:
                     gather_list = [
                         torch.empty_like(outputs)
-                        for _ in self.get_group_size("dp")
+                        for _ in range(self.get_group_size("dp"))
                     ]
 
                 torch.distributed.gather(
@@ -937,7 +937,7 @@ class TorchTitanServer(TCPServer):
                 if dp_group_rank == 0:
                     gather_list = [
                         torch.empty_like(first_seq_elem_indices)
-                        for _ in self.get_group_size("dp")
+                        for _ in range(self.get_group_size("dp"))
                     ]
 
                 torch.distributed.gather(
