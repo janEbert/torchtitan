@@ -384,7 +384,7 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
         return output_dict[dummy_mask]
 
     def _normalize_inputs(self, inputs):
-        if not isinstance(inputs, list):
+        if not isinstance(inputs, list) or isinstance(inputs, list) and isinstance(inputs[0], int):
             inputs = [inputs]
         return inputs
 
