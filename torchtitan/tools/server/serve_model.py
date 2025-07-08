@@ -362,6 +362,7 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
         # longtensor start pos END
 
         inputs, first_seq_elem_indices, orig_seq_lens = self._to_token_tensor(inputs, start_pos)
+        input_tokens = inputs.tolist()
         inputs, dummy_mask = self._dummy_pad_inputs(inputs)
         sharded_input_dict["input"] = self._shard_inputs(inputs)
 
@@ -376,7 +377,7 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
         # dummy_mask = self._shard_inputs(dummy_mask)
         # output_indices = torch.nonzero(dummy_mask).tolist()
 
-        return sharded_input_dict, dummy_mask
+        return sharded_input_dict, dummy_mask, input_tokens
         # return sharded_input_dict, output_indices
 
     def _select_outputs(self, output_dict, dummy_mask):
@@ -456,7 +457,7 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
         return input_dict
 
     def serve_step(self, input_dict: dict[str, Any], logits_only: bool):
-        input_dict, dummy_mask = self._distribute_inputs(input_dict)
+        input_dict, dummy_mask, input_tokens = self._distribute_inputs(input_dict)
         # input_dict, output_indices = self._distribute_inputs(input_dict)
 
         inputs = input_dict["input"]
@@ -570,7 +571,6 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
                     output_logits=output_logits,
                 )
 
-            input_tokens = input_dict["input"].tolist()
             for (i, (sample, sample_first_seq_elem_index)) in enumerate(zip(
                     input_tokens,
                     first_seq_elem_indices,
