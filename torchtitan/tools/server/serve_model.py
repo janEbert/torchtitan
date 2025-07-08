@@ -242,7 +242,7 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
                 assert new_batch_size % dp_size == 0
         dummy_mask = torch.ones(inputs.shape[0], dtype=torch.bool)
         if pad_size > 0:
-            dummy_mask[:-pad_size] = 0
+            dummy_mask[-pad_size:] = 0
         return inputs, dummy_mask
 
     # Root: global rank = 0, dp = 0, tp = 0, etc.
