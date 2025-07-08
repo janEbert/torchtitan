@@ -119,7 +119,7 @@ def main(args_list: list[str] | None = None):
                     logger.debug(f"{output_dict = }")
                     curr_logits = []
                     for res_index in res_indices:
-                        logits = output_dict["output_logits"][res_index]
+                        logits = output_dict["output_logits"][res_index][-1:]
                         # if not math.isclose(logits[0][0], -1.5577514171600342):
                         #     print('FUCK')
                         #     exit()
