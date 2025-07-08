@@ -156,7 +156,7 @@ def main(args_list: list[str] | None = None):
                         prompts[i] = prefix + suffix
                     else:
                         prompts[i] = suffix
-                    print(f'{prompts[i] = }, {prefix = }, {suffix = }')
+                    print(f'{i = }, {prompts[i] = }, {prefix = }, {suffix = }')
 
             tok = ByteTokenizer()
             print(f'{result_bytes = }')
