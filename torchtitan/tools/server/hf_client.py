@@ -209,6 +209,7 @@ class TorchTitanClientModel(TorchTitanClientPreTrainedModel):
         self.server_port = config.server_port
         self.seed = config.seed
 
+        # self.vocab_size = self.model.vocab_size
         # self.padding_idx = self.model.vocab_size
 
         # Add a dummy parameter
@@ -291,7 +292,7 @@ class TorchTitanClientForCausalLM(TorchTitanClientPreTrainedModel, GenerationMix
     def __init__(self, config):
         super().__init__(config)
         self.model = TorchTitanClientModel(config)
-        self.vocab_size = self.model.vocab_size
+        # self.vocab_size = self.model.vocab_size
 
         # We do _not_ want to call `self.post_init`
 
