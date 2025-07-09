@@ -131,11 +131,10 @@ class TorchTitanClientModel(TorchTitanClientPreTrainedModel):
         else:
             start_pos = -1
 
+        input_dict = dict(input=input_ids.tolist(), start_pos=start_pos, seed=self.seed)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             # Connect to server and send data
             sock.connect((self.server_address, self.server_port))
-
-            input_dict = dict(input=input_ids, start_pos=start_pos, seed=self.seed)
             send_request(input_dict, sock)
 
             # Receive data from the server and shut down

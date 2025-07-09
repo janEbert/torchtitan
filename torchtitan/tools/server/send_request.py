@@ -70,11 +70,10 @@ def main(args_list: list[str] | None = None):
     seeds = []
 
     for i in range(10):
+        input_dict = dict(input=prompts, start_pos=start_pos, seed=seed, top_k=1)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             # Connect to server and send data
             sock.connect((args.server_address, args.server_port))
-
-            input_dict = dict(input=prompts, start_pos=start_pos, seed=seed, top_k=1)
             send_request(input_dict, sock)
 
             # Receive data from the server and shut down
