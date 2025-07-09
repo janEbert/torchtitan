@@ -551,6 +551,8 @@ def build_hf_dataloader(
     rng = torch.Generator()
     if job_config.training.dataset_seed is not None:
         rng.manual_seed(job_config.training.dataset_seed)
+    else:
+        rng.seed()
     return ParallelAwareDataloader(
         dataset=hf_ds,
         dp_rank=dp_rank,
