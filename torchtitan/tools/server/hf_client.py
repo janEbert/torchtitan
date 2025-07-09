@@ -258,6 +258,10 @@ class TorchTitanClientModel(TorchTitanClientPreTrainedModel):
         else:
             start_pos = -1
 
+        if start_pos > 0:
+            assert input_ids.shape[1] == 1, \
+                "currently, inputs after the KV-cache has been created need to be given one by one"
+
         input_dict = dict(input=input_ids.tolist(), start_pos=start_pos, seed=self.seed)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             # Connect to server and send data
