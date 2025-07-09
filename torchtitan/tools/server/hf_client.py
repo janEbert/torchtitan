@@ -229,6 +229,7 @@ class TorchTitanClientModel(TorchTitanClientPreTrainedModel):
         cache_position: torch.LongTensor | None = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
+        assert input_ids is not None, "supplying `input_ids` is required"
         assert inputs_embeds is None, "`inputs_embeds` is not supported"
         assert output_attentions is None, "`output_attentions` is not supported"
         assert output_hidden_states is None, "`output_hidden_states` is not supported"
