@@ -1,14 +1,20 @@
 from argparse import ArgumentParser
+import os
 import sys
 
 import torch
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from torchtitan.tools.server.hf_client import (
     TorchTitanByteTokenizer,
     TorchTitanClientConfig,
     TorchTitanClientForCausalLM,
 )
-from torchtitan.tools.server.serve_model import DEFAULT_PORT, logits_to_probs, multinomial_sample_one
+from torchtitan.tools.server.serve_model import (
+    DEFAULT_PORT,
+    logits_to_probs,
+    multinomial_sample_one,
+)
 
 
 def parse_args(args_list: list[str] | None = None):
@@ -40,16 +46,34 @@ def parse_args(args_list: list[str] | None = None):
 def main(args_list: list[str] | None = None):
     args = parse_args(args_list)
 
-    use_generate = False
+    use_auto = True
+    use_generate = True
     seed = args.seed
 
-    config = TorchTitanClientConfig(
-        server_address=args.server_address,
-        server_port=args.server_port,
-        seed=args.seed,
-    )
-    tok = TorchTitanByteTokenizer()
-    model = TorchTitanClientForCausalLM(config)
+    if use_auto:
+        hf_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "./hf_client"))
+        config = AutoConfig.from_pretrained(hf_path, trust_remote_code=True)
+        config.server_address = args.server_address
+        config.server_port = args.server_port
+        config.seed = args.seed
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+        # model = AutoModelForCausalLM.from_pretrained(
+        #     hf_path,
+        #     server_address=args.server_address,
+        #     server_port=args.server_port,
+        #     trust_remote_code=True,
+        # )
+        tok = AutoTokenizer.from_pretrained(hf_path, trust_remote_code=True)
+        # model.save_pretrained(hf_path + "_new")
+        # tok.save_pretrained(hf_path + "_new")
+    else:
+        config = TorchTitanClientConfig(
+            server_address=args.server_address,
+            server_port=args.server_port,
+            seed=args.seed,
+        )
+        tok = TorchTitanByteTokenizer()
+        model = TorchTitanClientForCausalLM(config)
 
     prompts = ["This is "]
     encoded = tok(prompts, return_tensors="pt", padding=True)

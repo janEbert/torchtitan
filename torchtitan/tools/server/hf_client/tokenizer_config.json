@@ -1,0 +1,9 @@
+{
+  "auto_map": {
+    "AutoTokenizer": [
+      "tokenization_torchtitan.TorchTitanByteTokenizer",
+      null
+    ]
+  },
+  "tokenizer_class": "TorchTitanByteTokenizer"
+}

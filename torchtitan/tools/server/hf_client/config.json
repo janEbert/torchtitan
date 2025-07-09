@@ -1,0 +1,18 @@
+{
+  "architectures": [
+    "TorchTitanClientForCausalLM"
+  ],
+  "auto_map": {
+    "AutoConfig": "configuration_torchtitanclient.TorchTitanClientConfig",
+    "AutoModel": "modeling_torchtitanclient.TorchTitanClientModel",
+    "AutoModelForCausalLM": "modeling_torchtitanclient.TorchTitanClientForCausalLM",
+    "AutoTokenizer": [
+      "tokenization_torchtitan.TorchTitanByteTokenizer",
+      null
+    ]
+  },
+  "model_type": "torchtitan_client",
+  "torch_dtype": "float32",
+  "transformers_version": "4.53.1",
+  "use_cache": true
+}
