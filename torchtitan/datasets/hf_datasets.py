@@ -549,10 +549,11 @@ def build_hf_dataloader(
         )
 
     rng = torch.Generator()
-    if job_config.training.dataset_seed is not None:
-        rng.manual_seed(job_config.training.dataset_seed)
-    else:
-        rng.seed()
+    if job_config.training.dataset_seed is None:
+        # Extract the seed for PyTorch's main generator.
+        dataset_seed_tensor = torch.get_rng_state()[:8]
+        job_config.training.dataset_seed = dataset_seed_tensor.to("cpu").view(torch.uint64).item()
+    rng.manual_seed(job_config.training.dataset_seed)
     return ParallelAwareDataloader(
         dataset=hf_ds,
         dp_rank=dp_rank,
