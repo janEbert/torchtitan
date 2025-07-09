@@ -270,7 +270,7 @@ class TorchTitanClientModel(TorchTitanClientPreTrainedModel):
             past_key_values.start_pos = start_pos
 
         return BaseModelOutputWithPast(
-            last_hidden_state=output_dict["output_logits"],
+            last_hidden_state=torch.tensor(output_dict["output_logits"]),
             past_key_values=past_key_values if use_cache else None,
             hidden_states=None,
             attentions=None,
