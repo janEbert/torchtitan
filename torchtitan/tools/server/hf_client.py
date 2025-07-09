@@ -211,6 +211,11 @@ class TorchTitanClientModel(TorchTitanClientPreTrainedModel):
 
         # self.padding_idx = self.model.vocab_size
 
+        # Add a dummy parameter
+        self.register_parameter(
+            "dummy",
+            torch.nn.Parameter(torch.tensor(0.0, requires_grad=False), requires_grad=False),
+        )
         # We do _not_ want to call `self.post_init`
 
     def set_seed(self, seed: int | None):
