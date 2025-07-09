@@ -539,6 +539,8 @@ class TorchTitanServerRequestHandler(BaseRequestHandler):
                 rng = torch.Generator()
                 if seed is not None:
                     rng.manual_seed(seed)
+                else:
+                    rng.seed()
                 seed = rng.initial_seed()
                 sampling_params["seed"] = seed
 
