@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 import copy
+import functools
 import os
 from typing import Callable
 
@@ -23,6 +24,8 @@ from torch.distributed.pipelining.schedules import (
 )
 
 from torchtitan.config import JobConfig
+from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.utils import get_param_dtype
 from torchtitan.tools.logging import logger
 
 
@@ -275,6 +278,8 @@ def pipeline_module_split(
     pp_schedule: str,
     device: torch.device,
     module_names_per_stage: list[list[str]],
+    job_config: JobConfig,
+    parallel_dims: ParallelDims,
 ) -> tuple[list[PipelineStage], list[nn.Module]]:
     """
     This API creates pipeline stages based on specified module names for each stage.
@@ -315,6 +320,8 @@ def pipeline_module_split(
         stage_idx: int, module_names: list[str], num_stages: int
     ) -> tuple[PipelineStage, nn.Module]:
         model = copy.deepcopy(whole_model)
+        dim = model.tok_embeddings.weight.shape[1]
+        vocab_size = model.tok_embeddings.weight.shape[0]
 
         # Create a set of modules to keep for faster lookup
         modules_to_keep = set(module_names)
@@ -356,12 +363,51 @@ def pipeline_module_split(
                 # Replace with None
                 setattr(model, module_name, None)
 
+        # ==== Here we infer the input and output shapes for the stage ====
+        # see https://github.com/pytorch/torchtitan/issues/1492
+
+        tp_size = parallel_dims.tp  # need tp_size for seq_len division
+
+        pp_mbs = job_config.parallelism.pipeline_parallel_microbatch_size
+        seq_len = job_config.training.seq_len
+        tp_seq_len = seq_len // max(tp_size, 1)
+        # loss_parallel_enabled = (
+        #     parallel_dims.tp_enabled and not job_config.parallelism.disable_loss_parallel
+        # )
+        # here is hard-coded for now, that we assume all hidden have Shard(1) placement on TP mesh
+
+        param_dtype = get_param_dtype(model)
+        assert param_dtype is not None, "empty module, could not find dtype"
+        empty_tensor = functools.partial(torch.empty, dtype=param_dtype, device="meta")
+
+        # First stage
+        if stage_idx == 0:
+            example_input = empty_tensor((pp_mbs, seq_len), dtype=torch.long)
+            example_output = empty_tensor((pp_mbs, tp_seq_len, dim))
+
+        # Last stage
+        elif stage_idx == num_stages - 1:
+            # Why we dont need this?
+            # # output_dim = (
+            #     vocab_size if not loss_parallel_enabled else vocab_size // tp_size
+            # )
+            example_input = empty_tensor((pp_mbs, tp_seq_len, dim))
+            example_output = empty_tensor((pp_mbs, seq_len, vocab_size))
+
+        # Middle stages
+        else:
+            example_input = empty_tensor((pp_mbs, tp_seq_len, dim))
+            example_output = empty_tensor((pp_mbs, tp_seq_len, dim))
+        # ============================================================
+
         stage = PipelineStage(
             model,
             stage_idx,
             num_stages,
             device,
             group=pp_mesh.get_group("pp"),
+            input_args=(example_input,),
+            output_args=(example_output,),
         )
         return stage, model
 

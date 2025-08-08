@@ -127,6 +127,8 @@ def pipeline_llama(
         job_config.parallelism.pipeline_parallel_schedule,
         device,
         module_names_per_stage,
+        job_config,
+        parallel_dims,
     )
 
     # For PP with looped schedules, each item in model_parts is one stage-model-chunk.
