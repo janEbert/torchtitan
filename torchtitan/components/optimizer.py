@@ -693,7 +693,7 @@ def _update_expert_bias(
                     )
 
                 moe.tokens_per_expert.zero_()
-                if entropy is not None:
+                if hasattr(moe, "router_entropy"):
                     moe.router_entropy.zero_()
 
 
