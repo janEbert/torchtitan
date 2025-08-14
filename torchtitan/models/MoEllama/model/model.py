@@ -129,6 +129,7 @@ class TransformerBlock(nn.Module):
         #     self.attention.forward = torch.compile(
         #         self.attention.forward, fullgraph=True
         #     )
+        self.layer_id = layer_id
         # TODO(JSC): Need ablation, feels like this does not really matter
         if model_args.moe_router_scaling_factor is None:
             router_scaling_factor = calc_gate_scaling_factor(
