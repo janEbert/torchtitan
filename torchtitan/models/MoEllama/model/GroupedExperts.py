@@ -11,28 +11,33 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
-# from ..infra.expert_parallel import expert_parallel
-
 from torchtitan.experiments.kernels.moe.indices import generate_permute_indices
 
 from torchtitan.models.inits import build_init_fn
 from torchtitan.models.norms import build_norm
 
-try:
-    from grouped_gemm.ops import gmm as grouped_gemm
-except ImportError:
+from torchtitan.distributed.expert_parallel import expert_parallel
 
-    def mock_grouped_gemm(x, w, m_sizes):
-        out = x.new_zeros(x.shape[0], w.shape[2])
-        # G = m_sizes.shape[0]
-        shift = 0
-        for g, n_tokens in enumerate(m_sizes):
-            input_tokens = x[shift : shift + n_tokens]
-            out[shift : shift + n_tokens] = input_tokens @ w[g]
-            shift += n_tokens
-        return out
 
-    grouped_gemm = mock_grouped_gemm
+@expert_parallel
+def _run_experts_grouped_mm(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    x: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor,
+    activation: Callable,
+    out_norm: nn.Module,
+) -> torch.Tensor:
+    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+    # grouped mm between a 2D tensor and a 3D tensor
+    assert x.dim() == 2
+
+    h = activation(torch._grouped_mm(x, w1, offs=offsets))
+    h = h * torch._grouped_mm(x, w3, offs=offsets)
+    out = torch._grouped_mm(out_norm(h), w2, offs=offsets)
+
+    return out
 
 
 class GroupedExperts(nn.Module):
@@ -52,6 +57,7 @@ class GroupedExperts(nn.Module):
     ep_enable = False
     expert_per_rank = -1
     ep_size = -1
+    layer_id = None  # layer_id is set when we build the transformer blocks
 
     def __init__(
         self,
@@ -109,50 +115,17 @@ class GroupedExperts(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        m_sizes: torch.LongTensor,
+        num_tokens_per_expert: torch.LongTensor,
     ) -> torch.Tensor:
-
-        if not self.ep_enable:
-            m_sizes = m_sizes.long()
-            h = grouped_gemm(x, self.w1, m_sizes)
-            h = self.act_fn(h) * grouped_gemm(x, self.w3, m_sizes)
-            h = grouped_gemm(self.out_norm(h), self.w2, m_sizes)
-            return h
-
-        # ###### BELOW IS THE EP REGIME #######
-        # TODO(JSC): For now, EP does not work with compile
-        ALIGN_SIZE_M = 16
-        # ALIGN_SIZE_M = 1
-
-        if ALIGN_SIZE_M > 1:
-            max_len = x.shape[0] + self.expert_per_rank * ALIGN_SIZE_M
-        else:
-            max_len = x.shape[0]
-
-        with torch.no_grad():
-            (permuted_indices, m_sizes, _,) = generate_permute_indices(  # offsets,
-                m_sizes,
-                self.expert_per_rank,
-                self.ep_size,
-                max_len,
-                ALIGN_SIZE_M,
-                use_cpu=True,
-            )
-
-        if ALIGN_SIZE_M > 1:
-            x = torch.vstack((x, x.new_zeros((x.shape[-1]))))
-        input_shape = x.shape
-        x = x[permuted_indices, :]
-        m_sizes = m_sizes.long()
-
-        out = grouped_gemm(x, self.w1.to_local(), m_sizes)
-        out = self.act_fn(out) * grouped_gemm(x, self.w3.to_local(), m_sizes)
-        out = grouped_gemm(self.out_norm(out), self.w2.to_local(), m_sizes)
-
-        out_unpermuted = out.new_empty(input_shape)
-        out_unpermuted[permuted_indices, :] = out
-        out = out_unpermuted[:-1]
-        return out
+        return _run_experts_grouped_mm(
+            self.w1,
+            self.w2,
+            self.w3,
+            x,
+            num_tokens_per_expert,
+            activation=self.act_fn,
+            out_norm=self.out_norm,
+        )
 
     def init_weights(
         self,
@@ -171,15 +144,23 @@ class GroupedExperts(nn.Module):
         else:
             expert_init_fn = init_all_experts_different
 
-        expert_init_fn(init_fn, self.w1.data, init_std)
-        expert_init_fn(init_fn, self.w3.data, gate_init_std)
-        expert_init_fn(init_fn, self.w2.data, init_std / residual_div)
+        expert_init_fn(init_fn, self.w1.data, init_std, slot=0, layer_id=self.layer_id)
+        expert_init_fn(
+            init_fn, self.w3.data, gate_init_std, slot=2, layer_id=self.layer_id
+        )
+        expert_init_fn(
+            init_fn,
+            self.w2.data,
+            init_std / residual_div,
+            slot=1,
+            layer_id=self.layer_id,
+        )
 
         if not isinstance(self.out_norm, nn.Identity):
             self.out_norm.reset_parameters()
 
 
-def init_all_experts_same(init_fn, w, init_std):
+def init_all_experts_same(init_fn, w, init_std, slot=None, layer_id=None):
     """
     Notice that the weights are in the shape of [G, D_in, D_out]
     But we expected the weights to be [D_out, D_in] for `init_fn`
@@ -199,21 +180,35 @@ def init_all_experts_same(init_fn, w, init_std):
         w.copy_(local_tensor)
 
 
-def init_all_experts_different(init_fn, w, init_std):
+def make_seed_from_global(
+    layer_id: int, slot: int, expert_id: int, total_experts: int
+) -> int:
+    # 3 slots per expert: w1, w2, w3
+    return layer_id * (3 * total_experts) + slot * total_experts + expert_id
+
+
+def init_all_experts_different(init_fn, w, init_std, slot, layer_id):
+    # we can remove `init_all_experts_same` at some point,
+    # because it seems bit of pointless to have it
+    # we should expect the experts to have same norms, rather than same weights
+    assert layer_id is not None, "layer_id must be set "
+    total_experts = w.shape[0]
     if isinstance(w, torch.distributed.tensor.DTensor):
+        # we assume the DTensor is already sharded on dim 0
         local_tensor = w.to_local()
+        shard_chunk = w.__create_chunk_list__()[0]
+        offsets = shard_chunk.offsets[0]
     else:
         local_tensor = w
+        offsets = 0
 
     for e in range(local_tensor.shape[0]):
-        rank = dist.get_rank()
-        rand_offset = torch.randint(0, 10000, size=(), device="cpu").item()
-        seed = rank * 50000 + e * 100 + rand_offset
-        # for each rank, layer, expert, [w1, w2, w3], we need to set a different seed
-        if w.device.type == "meta":
+        expert_id = e + offsets
+        seed = make_seed_from_global(layer_id, slot, expert_id, total_experts)
+        if local_tensor.device.type == "meta":
             rng = None
         else:
-            rng = torch.Generator(device=w.device)
+            rng = torch.Generator(device=local_tensor.device)
             rng.manual_seed(seed)
 
         init_fn(local_tensor[e].transpose(0, 1), mean=0.0, std=init_std, generator=rng)

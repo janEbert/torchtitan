@@ -169,6 +169,8 @@ class TransformerBlock(nn.Module):
                 norm_type=model_args.norm_type,
                 norm_eps=model_args.norm_eps,
             )
+            self.feed_forward.experts.layer_id = layer_id
+
         else:
             hidden_dim = 2 * 4 * model_args.dim / 3
             if model_args.ffn_dim_multiplier is not None:
@@ -177,7 +179,7 @@ class TransformerBlock(nn.Module):
 
             self.feed_forward = FeedForward(dim=model_args.dim, hidden_dim=hidden_dim)
 
-        self.feed_forward.experts.layer_id = layer_id
+        self.feed_forward.layer_id = layer_id
 
         self.attention_norm = build_norm(
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps

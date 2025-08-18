@@ -15,7 +15,7 @@ from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecision
 from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
-    # parallelize_module, # we wrap it at the end of this file
+    parallelize_module,
     PrepareModuleInput,
     PrepareModuleOutput,
     RowwiseParallel,
@@ -32,10 +32,9 @@ from torchtitan.models.llama3.infra.parallelize import (
 from torchtitan.models.llama3.model.bitnet_model import BitNetTransformerBlock
 from torchtitan.tools.logging import logger
 
-from .expert_parallel import (
+from torchtitan.distributed.expert_parallel import (
+    NoParallel,
     ExpertParallel,
-    # ExpertTensorParallel,
-    # NoParallel,
     TensorParallel,
 )
 
@@ -109,7 +108,9 @@ def parallelize_llama(
             ep_mesh=world_mesh["ep"] if parallel_dims.ep_enabled else None,
             ep_tp_mesh=(
                 world_mesh["ep", "tp"]
-                if parallel_dims.tp_enabled and parallel_dims.ep_enabled
+                if parallel_dims.tp_enabled
+                and parallel_dims.ep_enabled
+                and parallel_dims.etp_enabled
                 else None
             ),
             tp_only_attention=tp_only_attention,
@@ -120,7 +121,7 @@ def parallelize_llama(
 
     # turn on per-TransformerBlock compile after AC wrapping and before FSDP
     if job_config.training.compile:
-        apply_compile(model)
+        apply_compile(model, ep_enabled=parallel_dims.ep_enabled)
 
     dp_mesh: DeviceMesh | None = None
     if parallel_dims.fsdp_enabled or parallel_dims.ep_enabled:
@@ -146,6 +147,7 @@ def parallelize_llama(
             pp_enabled=parallel_dims.pp_enabled,
             cpu_offload=job_config.training.enable_cpu_offload,
             reshard_after_forward_policy=job_config.parallelism.fsdp_reshard_after_forward,
+            ep_degree=parallel_dims.ep,
             dp_mod_ep_mesh=(
                 world_mesh[tuple(dp_mod_ep_mesh_dim_names)]
                 if dp_mod_ep_mesh_dim_names
@@ -395,21 +397,19 @@ def apply_moe_ep_tp(
             )
 
 
-def apply_compile(model: nn.Module):
+def apply_compile(model: nn.Module, ep_enabled: bool):
     """
     Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
     repeated structure. Alternatively one can compile the whole model (after applying DP).
     """
-    import torch._dynamo
+    torch._dynamo.config.capture_scalar_outputs = True
 
     for layer_id, transformer_block in model.layers.named_children():
-        torch._dynamo.config.capture_scalar_outputs = True
-        # torch._dynamo.config.suppress_errors = True
-        # torch._dynamo.config.cache_size_limit = 16
-        transformer_block = torch.compile(
-            transformer_block,
-            fullgraph=True,
-        )
+        # we dont do compile when EP enabled
+        fullgraph = True and not ep_enabled
+        # if transformer_block.moe_enabled:
+        #     fullgraph = False
+        transformer_block = torch.compile(transformer_block, fullgraph=fullgraph)
         model.layers.register_module(layer_id, transformer_block)
 
     logger.info("Compiling each TransformerBlock with torch.compile")
@@ -423,6 +423,7 @@ def apply_fsdp(
     pp_enabled: bool,
     cpu_offload: bool = False,
     reshard_after_forward_policy: str = "default",
+    ep_degree: int = 1,
     dp_mod_ep_mesh: DeviceMesh | None = None,
     gradient_divide_factor: int | None = None,
 ):
@@ -448,28 +449,32 @@ def apply_fsdp(
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
-    for layer_id, transformer_block in model.layers.items():
-        if reshard_after_forward_policy == "always":
+    match reshard_after_forward_policy:
+        case "always":
             reshard_after_forward = True
-        elif reshard_after_forward_policy == "never":
+        case "never":
             reshard_after_forward = False
-        elif reshard_after_forward_policy == "default":
-            if pp_enabled:
-                # For PP, do not reshard after forward to avoid per-microbatch
-                # all-gathers, which can be expensive and non-overlapped
-                reshard_after_forward = False
-            else:
-                # As an optimization, do not reshard after forward for the last
-                # transformer block since FSDP would prefetch it immediately
-                reshard_after_forward = int(layer_id) < len(model.layers) - 1
-        else:
+        case "default":
+            # For PP, by default do not reshard after forward to avoid per-microbatch
+            # all-gathers, which can be expensive and non-overlapped
+            reshard_after_forward = not pp_enabled
+        case _:
             raise ValueError(
                 f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."
             )
 
-        # NOTE: in an MoE layer, the router and the shared experts
-        #       are sharded together with the TransformerBlock
-        if transformer_block.moe_enabled and dp_mod_ep_mesh:
+    if model.tok_embeddings is not None:
+        fully_shard(
+            model.tok_embeddings,
+            **fsdp_config,
+            reshard_after_forward=reshard_after_forward,
+        )
+
+    for layer_id, transformer_block in model.layers.items():
+        # NOTE: When EP is enabled, In an MoE layer, we use the following FSDP wrapping
+        # - the router and the shared experts are sharded together with the TransformerBlock
+        # - the routed experts are sharded with the remaining dp_mod_ep_mesh
+        if transformer_block.moe_enabled and ep_degree > 1:
             fsdp_mod_ep_config = fsdp_config.copy()
             fsdp_mod_ep_config["mesh"] = dp_mod_ep_mesh
             fully_shard(
@@ -491,162 +496,14 @@ def apply_fsdp(
             **fsdp_config,
             reshard_after_forward=reshard_after_forward,
         )
-    fully_shard(model, **fsdp_config, reshard_after_forward=not pp_enabled)
 
-
-from typing import Optional, Union
-
-# this is missing at pytorch 2.6
-# for pytorch 2.7, we can import from pytorch directly
-# https://github.com/pytorch/pytorch/blob/main/torch/distributed/tensor/parallel/style.py#L704
-from torch.distributed.tensor.parallel.style import ParallelStyle
-from torch.distributed.tensor.placement_types import Placement
-
-
-class PrepareModuleInputOutput(ParallelStyle):
-    def __init__(
-        self,
-        *,
-        input_layouts: Optional[Union[Placement, tuple[Optional[Placement]]]] = None,
-        desired_input_layouts: Optional[
-            Union[Placement, tuple[Optional[Placement]]]
-        ] = None,
-        input_kwarg_layouts: Optional[dict[str, Placement]] = None,
-        desired_input_kwarg_layouts: Optional[dict[str, Placement]] = None,
-        use_local_input: bool = False,
-        output_layouts: Union[Placement, tuple[Placement]],
-        desired_output_layouts: Union[Placement, tuple[Placement]],
-        use_local_output: bool = True,
-    ):
-        self.prepare_module_input = PrepareModuleInput(
-            input_layouts=input_layouts,
-            desired_input_layouts=desired_input_layouts,
-            input_kwarg_layouts=input_kwarg_layouts,
-            desired_input_kwarg_layouts=desired_input_kwarg_layouts,
-            use_local_output=use_local_input,
-        )
-        self.prepare_module_output = PrepareModuleOutput(
-            output_layouts=output_layouts,
-            desired_output_layouts=desired_output_layouts,
-            use_local_output=use_local_output,
+    # As an optimization, do not reshard_after_forward the last layers by default
+    # since FSDP would prefetch them immediately after the forward pass
+    if model.norm is not None and model.output is not None:
+        fully_shard(
+            [model.norm, model.output],
+            **fsdp_config,
+            reshard_after_forward=reshard_after_forward_policy == "always",
         )
 
-    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        self.prepare_module_input._apply(module, device_mesh)
-        self.prepare_module_output._apply(module, device_mesh)
-
-        return module
-
-    def __repr__(self) -> str:
-        tmpstr = self.__class__.__name__ + "("
-        tmpstr += f"input_layouts={self.prepare_module_input.input_layouts}, "
-        tmpstr += (
-            f"desired_input_layouts={self.prepare_module_input.desired_input_layouts}, "
-        )
-        tmpstr += (
-            f"input_kwarg_layouts={self.prepare_module_input.input_kwarg_layouts}, "
-        )
-        tmpstr += f"desired_input_kwarg_layouts={self.prepare_module_input.desired_input_kwarg_layouts}, "
-        tmpstr += f"use_local_input={self.prepare_module_input.use_local_output}, "
-        tmpstr += f"output_layouts={self.prepare_module_output.output_layouts}, "
-        tmpstr += f"desired_output_layouts={self.prepare_module_output.desired_output_layouts}, "
-        tmpstr += f"use_local_output={self.prepare_module_output.use_local_output}"
-        tmpstr += ")"
-        return tmpstr
-
-
-# https://github.com/pytorch/pytorch/blob/main/torch/distributed/tensor/parallel/api.py
-# see commit https://github.com/pytorch/pytorch/commit/5633283574c458bd6a3cbb6a0a890f0cb9c8b2b5
-# There is a werid bugs in `parallelize_module` for a while that it call the function `_validate_tp_mesh_dim`,
-# how ever this function only exam the "master" mesh, but did not check the 'sub-mesh'
-# thereforce, if we wana `parallelize_module` to work on device_mesh that is a sub-mesh, it will raise the error.
-
-import warnings
-from fnmatch import fnmatch
-from typing import Optional, Union
-
-import torch
-import torch.nn as nn
-from torch.distributed.device_mesh import _mesh_resources, DeviceMesh
-from torch.distributed.tensor.parallel.style import ParallelStyle
-
-
-def parallelize_module(  # type: ignore[return]
-    module: nn.Module,
-    device_mesh: Optional[DeviceMesh] = None,
-    parallelize_plan: Optional[Union[ParallelStyle, dict[str, ParallelStyle]]] = None,
-    *,
-    src_data_rank: Optional[int] = 0,
-) -> nn.Module:
-    # torch._C._log_api_usage_once("torch.distributed.tensor.parallel.parallelize_module")
-
-    device_mesh = device_mesh or _mesh_resources.get_current_mesh()
-
-    if parallelize_plan is None:
-        warnings.warn(
-            "No parallelize_plan is provided and auto-parallel is not supported "
-            "at the moment, so this parallelize_module call will do nothing."
-        )
-        return module
-
-    # note: The RNG tracker will be initialized in distribute_tensor() call if it hasn't
-    # been initialized.
-
-    if isinstance(parallelize_plan, ParallelStyle):
-        parallelize_plan.src_data_rank = src_data_rank
-        return parallelize_plan._apply(module, device_mesh)
-    elif isinstance(parallelize_plan, dict):
-        for module_path, parallelize_style in parallelize_plan.items():
-            if module_path == "":
-                # shortcut: empty string means to apply the plan to the current module
-                parallelize_module(module, device_mesh, parallelize_style)
-                continue
-
-            path_splits = module_path.split(".")
-            # Instead of blindly popping tokens, first check the match,
-            # we only consume/pop the token if we found a match.
-            token = path_splits[0]
-
-            matched_children = list(
-                filter(
-                    # `t[0]` is child name
-                    lambda t: fnmatch(t[0], token),
-                    module.named_children(),
-                )
-            )
-            if not matched_children:
-                # No match at this level. Log a warning and process next plan entry.
-                warnings.warn(
-                    f"Parallelize plan key '{module_path}' could not be resolved: "
-                    f"no submodule matching token '{token}' in module {module}, "
-                    f"skipping this plan entry."
-                )
-                continue
-
-            # Now that we have a match, we can consume the token.
-            path_splits.pop(0)
-            # apply the plan to all matched submodules
-            for _, submodule in matched_children:
-                if path_splits:
-                    # we haven't reached the leaf, apply in dict style
-                    leaf_path = ".".join(path_splits)  # rest of the path after `token`
-                    parallelize_module(
-                        submodule,
-                        device_mesh,
-                        {leaf_path: parallelize_style},
-                        src_data_rank=src_data_rank,
-                    )
-                else:
-                    # otherwise, directly apply style to this submodule
-                    parallelize_module(
-                        submodule,
-                        device_mesh,
-                        parallelize_style,
-                        src_data_rank=src_data_rank,
-                    )
-        return module
-    else:
-        raise TypeError(  # pyre-ignore[7]
-            "Expect Union[ParallelStyle, Dict[str, ParallelStyle]] for"
-            f" parallelize_plan, {type(parallelize_plan)} found!"
-        )
+    fully_shard(model, **fsdp_config)
