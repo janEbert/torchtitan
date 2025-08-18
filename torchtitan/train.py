@@ -440,10 +440,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 json.dump(config_dict, f, indent=4)
 
             clean_config_dict = {}
-            for (header, subdict) in config_dict.items():
+            for header, subdict in config_dict.items():
                 clean_subdict = {}
                 clean_config_dict[header] = clean_subdict
-                for (key, value) in subdict.items():
+                for key, value in subdict.items():
                     if value is not None:
                         clean_subdict[key] = value
 
@@ -578,6 +578,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         accumulated_aux_losses = []
         # If data runs out during gradient accumulation, that
         # entire step will not be executed.
+        fwd_bwd_start = time.perf_counter()
         for microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = next(data_iterator)
             loss, aux_loss = self.forward_backward_step(input_dict, labels)
@@ -585,6 +586,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if aux_loss is not None:
                 accumulated_aux_losses.append(aux_loss.detach())
 
+        self.metrics_processor.fwd_bwd_times.append(time.perf_counter() - fwd_bwd_start)
         grad_norm = None
         if self.job_config.training.max_norm > 0:
             grad_norm = dist_utils.clip_grad_norm_(
@@ -610,8 +612,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if need_to_calculate_norm:
             self.optimizers.calculate_norm_at_next_step()
 
+        optim_step_start = time.perf_counter()
         self.optimizers.step()
         self.lr_schedulers.step()
+        self.metrics_processor.optim_step_times.append(
+            time.perf_counter() - optim_step_start
+        )
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
