@@ -24,6 +24,8 @@ from torch.distributed.tensor.parallel import (
 
 from torchtitan.config import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims
+
+from torchtitan.distributed.expert_parallel import ExpertParallel, TensorParallel
 from torchtitan.models.llama3.infra.parallelize import (
     apply_ac,
     apply_ddp,
@@ -31,13 +33,6 @@ from torchtitan.models.llama3.infra.parallelize import (
 )
 from torchtitan.models.llama3.model.bitnet_model import BitNetTransformerBlock
 from torchtitan.tools.logging import logger
-
-from .expert_parallel import (
-    ExpertParallel,
-    # ExpertTensorParallel,
-    # NoParallel,
-    TensorParallel,
-)
 
 
 def parallelize_llama(
