@@ -13,6 +13,7 @@ from torch import nn
 from torchtitan.distributed.expert_parallel import expert_parallel
 from torchtitan.models.inits import build_init_fn
 from torchtitan.models.norms import build_norm
+from torchtitan.models.activation import build_activation
 
 
 @expert_parallel
@@ -56,8 +57,7 @@ class GroupedExperts(nn.Module):
         dim_in: int,
         dim_hidden: int,
         num_experts: int = 1,
-        activation: Callable = F.silu,
-        moe_init_all_experts_same: bool = False,
+        activation: str = "silu",
         norm_everywhere: bool = False,
         norm_type: str | None = None,
         norm_eps: float | None = None,
@@ -73,9 +73,7 @@ class GroupedExperts(nn.Module):
         self.w2 = nn.Parameter(torch.empty(num_experts, dim_hidden, dim_in))
         self.w3 = nn.Parameter(torch.empty(num_experts, dim_in, dim_hidden))
 
-        self.act_fn = activation
-
-        self.init_all_experts_same = moe_init_all_experts_same
+        self.act_fn = build_activation(activation)
 
         # when ep is enabled, this is set in parallelize.py
         self.ep_enable = False
@@ -132,11 +130,8 @@ class GroupedExperts(nn.Module):
         init_fn = build_init_fn(init_fn_type)
         gate_init_std = init_std / residual_div if init_gate_as_residual else init_std
 
-        if self.init_all_experts_same:
-            expert_init_fn = init_all_experts_same
-
-        else:
-            expert_init_fn = init_all_experts_different
+        # lets always use different experts
+        expert_init_fn = init_all_experts_different
 
         expert_init_fn(init_fn, self.w1.data, init_std, slot=0, layer_id=self.layer_id)
         expert_init_fn(

@@ -29,7 +29,7 @@ class TransformerModelArgs(BaseModelArgs):
     ffn_dim_multiplier: float | None = None
     norm_eps: float = 1e-5
     rope_theta: float = 10000
-
+    activation: str = "silu"
     max_seq_len: int = 131072
     # If `True`, then each transformer block init uses its layer ID, and
     # if `False`, each uses the total number of transformer blocks. If
@@ -83,6 +83,9 @@ class TransformerModelArgs(BaseModelArgs):
         ]:
             value = getattr(job_config.model, name)
             setattr(self, name, value)
+
+        if job_config.model.activation is not None:
+            self.activation = job_config.model.activation
 
         self.num_mtp_modules = job_config.training.num_mtp_tokens
         assert self.num_mtp_modules >= 0

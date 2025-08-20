@@ -84,16 +84,15 @@ class TransformerBlock(nn.Module):
                 dim=model_args.dim,
                 multiple_of=model_args.multiple_of,
                 ffn_dim_multiplier=model_args.ffn_dim_multiplier,
+                activation=model_args.activation,
                 n_shared_experts=model_args.n_shared_experts,
                 n_routed_experts=model_args.n_routed_experts,
                 activate_experts=model_args.activate_experts,
-                use_bias_for_routing=model_args.moe_router_use_bias_for_routing,
                 bias_update_speed=model_args.moe_router_bias_update_speed,
                 aux_loss_alpha=model_args.moe_aux_loss_alpha,
                 bias_update_norm_factor=model_args.moe_router_bias_update_norm_factor,
                 match_dim_with_dense=True,
                 router_scaling_factor=router_scaling_factor,
-                moe_init_all_experts_same=model_args.moe_init_all_experts_same,
                 norm_everywhere=model_args.norm_everywhere,
                 norm_type=model_args.norm_type,
                 norm_eps=model_args.norm_eps,
@@ -104,7 +103,14 @@ class TransformerBlock(nn.Module):
                 hidden_dim = model_args.ffn_dim_multiplier * hidden_dim
             hidden_dim = int(hidden_dim - hidden_dim % model_args.multiple_of)
 
-            self.feed_forward = FeedForward(dim=model_args.dim, hidden_dim=hidden_dim)
+            self.feed_forward = FeedForward(
+                dim=model_args.dim,
+                hidden_dim=hidden_dim,
+                activation=model_args.activation,
+                norm_everywhere=model_args.norm_everywhere,
+                norm_type=model_args.norm_type,
+                norm_eps=model_args.norm_eps,
+            )
 
         self.attention_norm = build_norm(
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps

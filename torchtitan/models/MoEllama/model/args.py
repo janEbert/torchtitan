@@ -27,6 +27,7 @@ class MoEModelArgs(BaseModelArgs):
     ffn_dim_multiplier: float | None = None
     norm_eps: float = 1e-5
     rope_theta: float = 10000
+    activation: str = "silu"
 
     max_seq_len: int = 2048
     # If `True`, then each transformer block init uses its layer ID, and
@@ -75,8 +76,6 @@ class MoEModelArgs(BaseModelArgs):
     moe_router_scaling_factor: float | None = None
     moe_router_bias_update_norm_factor: str = "sign"  # sign or spectral
     # dpskv3 2.5, moonlight 2.446, set None to auto-compute
-    moe_router_use_bias_for_routing: bool = True
-    moe_init_all_experts_same: bool = False
 
     def update_from_config(self, job_config: JobConfig, **kwargs) -> None:
         for name in [
@@ -95,6 +94,20 @@ class MoEModelArgs(BaseModelArgs):
             "norm_type",
         ]:
             value = getattr(job_config.model, name)
+            setattr(self, name, value)
+
+        for name in [
+            "activation",
+            "moe_router_bias_update_norm_factor",
+            "moe_router_scaling_factor",
+        ]:
+            value = getattr(job_config.model, name)
+            if value is not None:
+                setattr(self, name, value)
+
+        for name in ["moe_aux_loss_alpha", "moe_router_bias_update_speed"]:
+            value = getattr(job_config.training, name)
+            value = 0 if value is None else value
             setattr(self, name, value)
 
         self.num_mtp_modules = job_config.training.num_mtp_tokens

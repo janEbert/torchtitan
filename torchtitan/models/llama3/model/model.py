@@ -16,6 +16,7 @@ from torchtitan.models.attention import build_attention, init_attention_mask
 from torchtitan.models.inits import build_init_fn
 from torchtitan.models.inputs import MTPInputs, MTPInputsDict
 from torchtitan.models.norms import build_norm
+from torchtitan.models.activation import build_activation
 from torchtitan.protocols.train_spec import ModelProtocol
 
 from .args import TransformerModelArgs
@@ -326,6 +327,7 @@ class FeedForward(nn.Module):
         hidden_dim: int,
         multiple_of: int,
         ffn_dim_multiplier: float | None,
+        activation: str = "silu",
         norm_everywhere: bool = False,
         norm_type: str | None = None,
         norm_eps: float | None = None,
@@ -340,6 +342,8 @@ class FeedForward(nn.Module):
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+
+        self.act_fn = build_activation(activation)
 
         if norm_everywhere:
             assert (
@@ -357,7 +361,7 @@ class FeedForward(nn.Module):
             self.out_norm = nn.Identity()
 
     def forward(self, x):
-        return self.w2(self.out_norm(F.silu(self.w1(x)) * self.w3(x)))
+        return self.w2(self.out_norm(self.act_fn(self.w1(x)) * self.w3(x)))
 
     def init_weights(
         self,
@@ -409,6 +413,7 @@ class TransformerBlock(nn.Module):
             hidden_dim=4 * model_args.dim,
             multiple_of=model_args.multiple_of,
             ffn_dim_multiplier=model_args.ffn_dim_multiplier,
+            activation=model_args.activation,
             norm_type=model_args.norm_type,
             norm_everywhere=model_args.norm_everywhere,
             norm_eps=model_args.norm_eps,
@@ -799,7 +804,7 @@ class Transformer(nn.Module, ModelProtocol):
             if self.norm and prev_embed is None:
                 prev_embed = h
 
-            for (mtp_layer_id, mtp_layer) in self.mtp_layers.items():
+            for mtp_layer_id, mtp_layer in self.mtp_layers.items():
                 mtp_layer_id = int(mtp_layer_id)
                 token_offset = mtp_layer_id + 1
                 output, prev_embed = mtp_layer(

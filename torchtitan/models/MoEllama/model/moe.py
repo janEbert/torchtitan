@@ -12,6 +12,7 @@ from torch import nn
 
 from torchtitan.models.inits import build_init_fn
 from torchtitan.models.norms import build_norm
+from torchtitan.models.activation import build_activation
 
 from .GroupedExperts import GroupedExperts
 
@@ -21,7 +22,7 @@ class FeedForward(nn.Module):
         self,
         dim: int,
         hidden_dim: int,
-        activation: Callable = torch.nn.functional.silu,
+        activation: str = "silu",
         norm_everywhere: bool = False,
         norm_type: Optional[str] = None,
         norm_eps: Optional[float] = None,
@@ -30,7 +31,7 @@ class FeedForward(nn.Module):
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
-        self.act_fn = activation
+        self.act_fn = build_activation(activation)
 
         if norm_everywhere:
             assert (
@@ -224,17 +225,16 @@ class MoE(nn.Module):
         layer_id: int,
         dim: int,
         multiple_of: int = 256,
+        activation: str = "silu",
         n_shared_experts: int = 1,
         n_routed_experts: int = 8,
         activate_experts: int = 2,
         ffn_dim_multiplier: Optional[float] = None,
         match_dim_with_dense: bool = True,
-        use_bias_for_routing: bool = True,
         bias_update_speed: float = 0.001,  # Bias adjustment speed
         aux_loss_alpha: float = 0.001,  # Small weight for sequence-wise auxiliary loss
         bias_update_norm_factor: str = "sign",
         router_scaling_factor: float = 1.0,
-        moe_init_all_experts_same: bool = False,
         norm_everywhere: bool = False,
         norm_type: Optional[str] = None,
         norm_eps: Optional[float] = None,
@@ -265,7 +265,6 @@ class MoE(nn.Module):
         self.n_shared_experts = n_shared_experts
         self.aux_loss_alpha = aux_loss_alpha  # Loss coefficient
         self.router_scaling_factor = router_scaling_factor
-        self.use_bias_for_routing = use_bias_for_routing
         self.bias_update_speed = bias_update_speed
         self.bias_update_norm_factor = bias_update_norm_factor
 
@@ -291,6 +290,7 @@ class MoE(nn.Module):
             self.shared_experts = FeedForward(
                 dim,
                 hidden_dim,
+                activation=activation,
                 norm_everywhere=norm_everywhere,
                 norm_type=norm_type,
                 norm_eps=norm_eps,
@@ -306,7 +306,7 @@ class MoE(nn.Module):
             dim_in=dim,
             dim_hidden=hidden_dim,
             num_experts=n_routed_experts,
-            moe_init_all_experts_same=moe_init_all_experts_same,
+            activation=activation,
             norm_everywhere=norm_everywhere,
             norm_type=norm_type,
             norm_eps=norm_eps,
@@ -365,10 +365,9 @@ class MoE(nn.Module):
             experts_entropy,
         ) = self.router(x, self.expert_bias)
         self.router_entropy.add_(experts_entropy)
-        if self.training and self.use_bias_for_routing:
+        if self.training:
             with torch.no_grad():
                 self.tokens_per_expert.add_(num_tokens_per_expert)
-
         (
             top_scores_experts_sorted,
             token_indices_experts_sorted,
@@ -393,7 +392,13 @@ class MoE(nn.Module):
 
         if self.training:
             aux_loss = self.sequence_wise_aux_loss(
-                selected_experts_indices.long(), sigmoid_scores, bz, slen
+                selected_experts_indices.long(),
+                sigmoid_scores,
+                bz,
+                slen,
+                self.n_routed_experts,
+                self.topk,
+                self.aux_loss_alpha,
             )
         else:
             aux_loss = torch.tensor(0.0, device=x.device)
@@ -401,13 +406,16 @@ class MoE(nn.Module):
         output = out.reshape(bz, slen, dim).to(x.dtype)
         return output, aux_loss
 
+    @staticmethod
     @torch.compile(fullgraph=True)
     def sequence_wise_aux_loss(
-        self,
         indices: torch.Tensor,  # Shape (B*S, K_val), type long
         scores: torch.Tensor,  # Shape (B*S, N_r_val), type float
         B: int,  # Batch size
         S: int,  # Sequence length
+        total_experts: int,
+        activate_experts: int,
+        aux_loss_alpha: float,
         eps: float = 1e-15,
         force_flip: bool = False,  # If True, clamps f_i^(b) and P_i^(b) to [0,1]
     ) -> torch.Tensor:
@@ -431,8 +439,8 @@ class MoE(nn.Module):
 
         """
 
-        N_r = self.n_routed_experts  # Total number of routed experts (N_r in formulas)
-        K_val = self.topk  # Number of experts selected per token (K in formulas)
+        N_r = total_experts  # Total number of routed experts (N_r in formulas)
+        K_val = activate_experts  # Number of experts selected per token (K in formulas)
 
         # Conditional returns based on your original code's logic
         # If topk == N_r, original code returned 0. This implies perfect load balancing by design.
@@ -440,7 +448,7 @@ class MoE(nn.Module):
             return torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
 
         # If not training, alpha is zero, or no experts are selected (K_val=0)
-        if not (self.aux_loss_alpha > 0 and K_val > 0):
+        if not (aux_loss_alpha > 0 and K_val > 0):
             return torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
 
         # If batch or sequence length is zero, no tokens to process.
@@ -516,6 +524,6 @@ class MoE(nn.Module):
         loss_per_sequence = (f_i_b_all * P_i_b_all).sum(dim=1)
 
         # 4. Final auxiliary loss:
-        aux_loss = loss_per_sequence.mean() * self.aux_loss_alpha
+        aux_loss = loss_per_sequence.mean() * aux_loss_alpha
 
         return aux_loss
