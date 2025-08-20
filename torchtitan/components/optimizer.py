@@ -607,25 +607,6 @@ def build_optimizers_with_moe_load_balancing(
         )
         # # TODO: Currently this sync is blocking (thus exposed) and happens on the
         # # default compute stream. Need to assess if this is OK performance-wise.
-        # for model_part in model_parts:
-        #     for transformer_block in model_part.layers.values():
-        #         if transformer_block.moe_enabled:
-        #             moe = transformer_block.moe
-        #             if moe.load_balance_coeff is None:
-        #                 return
-
-        #             if dp_cp_mesh is not None:
-        #                 torch.distributed.all_reduce(
-        #                     moe.tokens_per_expert, group=dp_cp_mesh.get_group()
-        #                 )
-
-        #             with torch.no_grad():
-        #                 expert_bias_delta = moe.load_balance_coeff * torch.sign(
-        #                     moe.tokens_per_expert.mean() - moe.tokens_per_expert
-        #                 )
-        #                 expert_bias_delta = expert_bias_delta - expert_bias_delta.mean()
-        #                 moe.expert_bias.add_(expert_bias_delta)
-        #                 moe.tokens_per_expert.zero_()
 
         # above is adapted from the upstream code
         # below is the optimized version that only uses 2 all_reduce calls
