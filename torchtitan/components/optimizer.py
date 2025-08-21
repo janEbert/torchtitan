@@ -636,7 +636,7 @@ def build_optimizers_with_moe_load_balancing(
             g = g.unsqueeze(0) if is_flat else g
             norms = torch.linalg.norm(g, ord=2, dim=1, keepdim=True)
             g = g / torch.clamp(norms, min=epsilon)
-            g = g.squeeze(0)
+            g = g.squeeze(0) if is_flat else g
             return g
 
     def need_rescale_stats(module):
