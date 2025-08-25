@@ -6,7 +6,9 @@
 
 import functools
 import os
+import queue
 import re
+import threading
 from collections import OrderedDict
 from typing import Any, Generic, Iterator, TypeVar
 
@@ -27,9 +29,6 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.optimizers import DistributedScion, naive_param_norm, Scion
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import Color
-import queue
-import threading
-import torch
 
 __all__ = [
     "OptimizersContainer",
@@ -574,9 +573,6 @@ def build_optimizers(
     return OptimizersContainer(model_parts, optimizer_cls, optimizer_kwargs)
 
 
-log_queue = queue.Queue()
-
-
 def metrics_worker():
     """
     This function runs in the background. It waits for data,
@@ -588,7 +584,13 @@ def metrics_worker():
         if data is None:  # Sentinel to stop the thread
             break
 
-        moe_layers_info, all_usages_cpu, all_biases_cpu, all_entropies_cpu = data
+        (
+            moe_layers_info,
+            all_usages_cpu,
+            all_biases_cpu,
+            all_entropies_cpu,
+            num_experts,
+        ) = data
 
         usage_offset = bias_offset = 0
         for i, info in enumerate(moe_layers_info):
@@ -599,16 +601,21 @@ def metrics_worker():
             layer_usages = all_usages_cpu[usage_offset : usage_offset + num_experts]
             layer_biases = all_biases_cpu[bias_offset : bias_offset + num_experts]
 
-            pu = f"moe_ep_usage/L-{layer_id}_EP-"
-            pb = f"moe_bias/L-{layer_id}_EP-"
-            metrics.update({f"{pu}{j}": v for j, v in enumerate(layer_usages)})
-            metrics.update({f"{pb}{j}": v for j, v in enumerate(layer_biases)})
+            pre_usage = f"moe_ep_usage/L-{layer_id}_EP-"
+            pre_bias = f"moe_bias/L-{layer_id}_EP-"
+            metrics.update({f"{pre_usage}{j}": v for j, v in enumerate(layer_usages)})
+            metrics.update({f"{pre_bias}{j}": v for j, v in enumerate(layer_biases)})
 
             moe._log_expert_metrics = metrics
             usage_offset += num_experts
             bias_offset += num_experts
 
         log_queue.task_done()
+
+
+log_queue = queue.Queue(maxsize=1)
+worker_thread = threading.Thread(target=metrics_worker, daemon=True)
+worker_thread.start()
 
 
 def build_optimizers_with_moe_load_balancing(
@@ -684,8 +691,8 @@ def build_optimizers_with_moe_load_balancing(
         if not moe_layers_info:
             return
 
-        all_tokens = torch.cat(tok_buffers).to(torch.float32)
-        all_entropies = torch.stack(ent_buffers)
+        all_tokens = torch.cat(tok_buffers)
+        all_entropies = torch.cat(ent_buffers)
 
         if scale_factor != 1:
             all_tokens *= scale_factor
@@ -753,17 +760,24 @@ def build_optimizers_with_moe_load_balancing(
 
             all_usages_cpu = usage_flat.cpu().tolist()
             all_biases_cpu = torch.cat(bias_params).cpu().tolist()
-            all_entropies_cpu = all_entropies.cpu().tolist()
+            all_entropies_cpu = all_entropies.cpu().float().tolist()
 
-        with torch.no_grad():
-            log_queue.put(
-                (
-                    moe_layers_info,
-                    all_usages_cpu,
-                    all_biases_cpu,
-                    all_entropies_cpu,
-                )
+            payload = (
+                moe_layers_info,
+                all_usages_cpu,
+                all_biases_cpu,
+                all_entropies_cpu,
+                num_experts,
             )
+            try:
+                log_queue.put_nowait(payload)
+            except queue.Full:
+                try:
+                    _ = log_queue.get_nowait()
+                    log_queue.task_done()
+                except queue.Empty:
+                    pass
+                log_queue.put_nowait(payload)
 
     optimizers.register_step_pre_hook(
         lambda *args, **kwargs: _update_expert_bias(
